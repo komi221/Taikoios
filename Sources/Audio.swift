@@ -64,6 +64,43 @@ final class SfxPool {
     }
 }
 
+/// 콤보 음성/풍선 효과음 묶음. 소리마다 노드를 하나씩 만들면 재생 중이 아닌 노드까지 오디오 스레드가
+/// 계속 돌려서 부하가 커지고 터치 때 끊김이 생긴다 → 같은 포맷끼리 노드 2개를 공유한다.
+final class VoiceBank {
+    private let buffers: [String: AVAudioPCMBuffer]
+    private var nodes: [String: [AVAudioPlayerNode]] = [:]
+    private var cursor: [String: Int] = [:]
+
+    private static func key(_ f: AVAudioFormat) -> String { "\(Int(f.sampleRate))-\(f.channelCount)" }
+
+    init(engine: AVAudioEngine, buffers: [String: AVAudioPCMBuffer]) {
+        self.buffers = buffers
+        var formats: [String: AVAudioFormat] = [:]
+        for b in buffers.values { formats[VoiceBank.key(b.format)] = b.format }
+        for (k, f) in formats {
+            var arr: [AVAudioPlayerNode] = []
+            for _ in 0..<2 {
+                let p = AVAudioPlayerNode()
+                engine.attach(p)
+                engine.connect(p, to: engine.mainMixerNode, format: f)
+                arr.append(p)
+            }
+            nodes[k] = arr
+        }
+    }
+
+    func play(_ name: String) {
+        guard let b = buffers[name] else { return }
+        let k = VoiceBank.key(b.format)
+        guard let arr = nodes[k], !arr.isEmpty else { return }
+        let i = cursor[k, default: 0]
+        cursor[k] = (i + 1) % arr.count
+        let p = arr[i]
+        p.scheduleBuffer(b, at: nil, options: .interrupts, completionHandler: nil)
+        if !p.isPlaying { p.play() }
+    }
+}
+
 /// 음악 + 효과음. 곡 시작 시각(startUptime)을 정확히 알고 있어서 판정 기준 시계로 쓴다.
 final class GameAudio {
     private let engine = AVAudioEngine()
@@ -71,7 +108,7 @@ final class GameAudio {
     private let musicBuffer: AVAudioPCMBuffer
     private var don: SfxPool?
     private var ka: SfxPool?
-    private var extra: [String: SfxPool] = [:]
+    private var voices: VoiceBank?
 
     private(set) var startUptime: Double = 0
     private(set) var latencyMs: Double = 0
@@ -90,11 +127,11 @@ final class GameAudio {
            let b = try? AudioDecoder.decode(url: u) { don = SfxPool(engine: engine, buffer: b) }
         if let u = Bundle.main.url(forResource: "neiro_1_ka", withExtension: "ogg"),
            let b = try? AudioDecoder.decode(url: u) { ka = SfxPool(engine: engine, buffer: b) }
-        for (name, b) in extras { extra[name] = SfxPool(engine: engine, buffer: b, count: 2) }
+        voices = VoiceBank(engine: engine, buffers: extras)
     }
 
     /// 미리 만들어 둔 풀로 재생 (없으면 무시)
-    func play(_ name: String) { extra[name]?.play() }
+    func play(_ name: String) { voices?.play(name) }
 
     /// 필요한 효과음을 백그라운드에서 미리 디코딩하기 위한 헬퍼
     static func decodeExtras(_ names: [String]) -> [String: AVAudioPCMBuffer] {
@@ -109,7 +146,6 @@ final class GameAudio {
     func start(leadIn: Double = 1.5) {
         do { try engine.start() } catch { return }
         don?.startAll(); ka?.startAll()
-        extra.values.forEach { $0.startAll() }
         let startHost = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: leadIn)
         music.scheduleBuffer(musicBuffer, at: nil, options: [], completionHandler: nil)
         music.play(at: AVAudioTime(hostTime: startHost))
