@@ -179,6 +179,8 @@ final class GameScene: SKScene {
     private var judgeList: [Int] = []
     private var judgePtr = 0
     private var rollList: [Int] = []
+    private var activeRolls: [Int] = []
+    private var rollCursor = 0
     private var balloonLeft: [Int: Int] = [:]
     private var doneRolls = Set<Int>()
     private var appear: [Double] = []
@@ -531,6 +533,7 @@ final class GameScene: SKScene {
             if nType[i] >= 5 { rollList.append(i) }
             if nType[i] == 7 { balloonLeft[i] = max(nBalloon[i], 1) }
         }
+        rollList.sort { nTime[$0] < nTime[$1] }
         let span = Double(W + 120 - slot.x)
         appear = (0..<n).map { nTime[$0] - span / nPps[$0] }
         spawnOrder = Array(0..<n).sorted { appear[$0] < appear[$1] }
@@ -621,6 +624,13 @@ final class GameScene: SKScene {
         let t = nowMs()
         let dt = lastFrame == 0 ? 16.7 : min(100, (currentTime - lastFrame) * 1000)
         lastFrame = currentTime
+
+        // 현재 시각에 활성화된 연타/풍선만 유지한다. 매 터치마다 전체 악보를 순회하지 않는다.
+        while rollCursor < rollList.count {
+            let idx = rollList[rollCursor]
+            if nTime[idx] - 10 <= t { activeRolls.append(idx); rollCursor += 1 } else { break }
+        }
+        activeRolls.removeAll { nEnd[$0] < t || doneRolls.contains($0) }
 
         while spawnPtr < spawnOrder.count && appear[spawnOrder[spawnPtr]] <= t {
             spawn(spawnOrder[spawnPtr]); spawnPtr += 1
@@ -791,7 +801,7 @@ final class GameScene: SKScene {
         touchMs = t
 
         // 연타/풍선
-        for ri in rollList where !doneRolls.contains(ri) {
+        for ri in activeRolls {
             guard t >= nTime[ri] - 10 && t <= nEnd[ri] else { continue }
             res.rollHits += 1
             let ty = nType[ri]
