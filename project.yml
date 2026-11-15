@@ -1,4 +1,4 @@
-name: TaikoMobile
+name: Taikoi
 options:
   bundleIdPrefix: dev.local
   deploymentTarget:
@@ -19,7 +19,7 @@ targets:
     info:
       path: Config/Info.plist
       properties:
-        CFBundleDisplayName: Taiko
+        CFBundleDisplayName: Taikoi
         UILaunchScreen: {}
         UIRequiresFullScreen: true
         UIStatusBarHidden: true
