@@ -381,10 +381,6 @@ struct SongListView: View {
             .navigationBarTitleDisplayMode(.inline)
             .taikoNavBar()
             .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Text("Taikoi").font(Theme.title(26)).foregroundColor(.white)
-                        .shadow(color: Theme.redDark, radius: 0, x: 1.5, y: 1.5)
-                }
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     if store.loading { ProgressView().tint(.white) }
                     Button(selecting ? "완료" : "선택") {
@@ -605,10 +601,6 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .taikoNavBar()
             .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Text("설정").font(Theme.title(22)).foregroundColor(.white)
-                        .shadow(color: Theme.redDark, radius: 0, x: 1.5, y: 1.5)
-                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("닫기") { dismiss() }.font(Theme.body(16)).foregroundColor(.white)
                 }
