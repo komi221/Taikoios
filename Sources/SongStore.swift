@@ -167,7 +167,8 @@ final class SongStore: ObservableObject {
     func ensureDownloaded(_ song: SongInfo) async throws -> (tja: URL, audio: URL) {
         let f = files(for: song)
         if isDownloaded(song) { return (f.tja, f.audio) }
-        if song.id < 0 { throw SimpleError("가져온 곡 파일이 없어요. 다시 가져와 주세요") }
+        if song.isLocal {
+              throw SimpleError("가져온 곡 파일이 없어요. 다시 가져와 주세요")}
         try fm.createDirectory(at: f.dir, withIntermediateDirectories: true)
         let base = await songsBaseURL()
         let tjaTmp = f.dir.appendingPathComponent("main.tja.part")
