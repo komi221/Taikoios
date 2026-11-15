@@ -68,3 +68,37 @@ func courseLabel(_ c: String) -> String {
     default: return c
     }
 }
+
+
+struct ScoreRecord: Codable {
+    var result: ResultData
+    var updatedAt: Date
+}
+
+enum BestScoreStore {
+    private static let key = "taiko.bestScores.v1"
+
+    private static func storage() -> [String: ScoreRecord] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let value = try? JSONDecoder().decode([String: ScoreRecord].self, from: data) else { return [:] }
+        return value
+    }
+
+    static func best(song: SongInfo, course: String) -> ScoreRecord? {
+        storage()["\\(song.id):\\(course)"]
+    }
+
+    @discardableResult
+    static func save(_ result: ResultData, song: SongInfo, course: String) -> ScoreRecord {
+        var all = storage()
+        let id = "\\(song.id):\\(course)"
+        let previous = all[id]
+        if previous == nil || result.score >= previous!.result.score {
+            all[id] = ScoreRecord(result: result, updatedAt: Date())
+            if let data = try? JSONEncoder().encode(all) {
+                UserDefaults.standard.set(data, forKey: key)
+            }
+        }
+        return all[id] ?? ScoreRecord(result: result, updatedAt: Date())
+    }
+}

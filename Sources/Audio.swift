@@ -71,6 +71,7 @@ final class GameAudio {
     private let musicBuffer: AVAudioPCMBuffer
     private var don: SfxPool?
     private var ka: SfxPool?
+    var drumSoundsEnabled = true
 
     private(set) var startUptime: Double = 0
     private(set) var latencyMs: Double = 0
@@ -84,10 +85,14 @@ final class GameAudio {
 
         engine.attach(music)
         engine.connect(music, to: engine.mainMixerNode, format: buffer.format)
-        if let u = Bundle.main.url(forResource: "neiro_1_don", withExtension: "ogg"),
-           let b = try? AudioDecoder.decode(url: u) { don = SfxPool(engine: engine, buffer: b) }
-        if let u = Bundle.main.url(forResource: "neiro_1_ka", withExtension: "ogg"),
-           let b = try? AudioDecoder.decode(url: u) { ka = SfxPool(engine: engine, buffer: b) }
+        let donURL = Bundle.main.url(forResource: "se_don", withExtension: "ogg", subdirectory: "Original/audio")
+            ?? Bundle.main.url(forResource: "se_don", withExtension: "ogg")
+            ?? Bundle.main.url(forResource: "neiro_1_don", withExtension: "ogg")
+        let kaURL = Bundle.main.url(forResource: "se_ka", withExtension: "ogg", subdirectory: "Original/audio")
+            ?? Bundle.main.url(forResource: "se_ka", withExtension: "ogg")
+            ?? Bundle.main.url(forResource: "neiro_1_ka", withExtension: "ogg")
+        if let u = donURL, let b = try? AudioDecoder.decode(url: u) { don = SfxPool(engine: engine, buffer: b) }
+        if let u = kaURL, let b = try? AudioDecoder.decode(url: u) { ka = SfxPool(engine: engine, buffer: b) }
     }
 
     /// leadIn 초 뒤에 곡이 시작되도록 예약한다.
@@ -102,10 +107,23 @@ final class GameAudio {
         latencyMs = (s.outputLatency + s.ioBufferDuration) * 1000
     }
 
-    func playSfx(don isDon: Bool) { (isDon ? don : ka)?.play() }
+    func playSfx(don isDon: Bool) { guard drumSoundsEnabled else { return }; (isDon ? don : ka)?.play() }
 
     func stop() {
         music.stop()
         engine.stop()
+    }
+}
+
+
+enum AudioDiagnostics {
+    static var reportedOutputLatencyMs: Double {
+        let session = AVAudioSession.sharedInstance()
+        return (session.outputLatency + session.ioBufferDuration) * 1000
+    }
+
+    static var currentOutputName: String {
+        let names = AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portName)
+        return names.isEmpty ? "알 수 없음" : names.joined(separator: ", ")
     }
 }

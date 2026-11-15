@@ -1,7 +1,7 @@
 import SpriteKit
 import UIKit
 
-struct ResultData {
+struct ResultData: Codable {
     var score = 0, good = 0, ok = 0, bad = 0, miss = 0
     var maxCombo = 0, rollHits = 0, total = 0
     var gaugePercent = 0.0
@@ -48,7 +48,9 @@ struct Rules {
 final class GameScene: SKScene {
     var chart: Chart!
     var audio: GameAudio!
-    var calMs = 0.0
+    var calMs = 0.0 // 구버전 설정 호환
+    var audioOffsetMs = 0.0
+    var videoOffsetMs = 0.0
     var speedScale = 1.0
     var onFinish: ((ResultData) -> Void)?
 
@@ -93,15 +95,25 @@ final class GameScene: SKScene {
     // MARK: 시계 (오디오 시작 시각 기준, 출력 지연 보정)
 
     private func songMs(_ uptime: Double) -> Double {
-        (uptime - audio.startUptime) * 1000 - audio.latencyMs - calMs
+        (uptime - audio.startUptime) * 1000 - audio.latencyMs - audioOffsetMs - calMs
     }
     private func nowMs() -> Double { songMs(ProcessInfo.processInfo.systemUptime) }
+    private func visualMs() -> Double { nowMs() + videoOffsetMs }
     private func pxPerMs(_ n: Note) -> Double { max(abs(n.speed), 1) / 60000.0 * beatPx }
 
     // MARK: 구성
 
     override func didMove(to view: SKView) {
         backgroundColor = SKColor(red: 0.09, green: 0.09, blue: 0.11, alpha: 1)
+        let bgURL = Bundle.main.url(forResource: "bg_genre_def", withExtension: "png", subdirectory: "Original/img")
+            ?? Bundle.main.url(forResource: "bg_genre_def", withExtension: "png")
+        if let url = bgURL, let image = UIImage(contentsOfFile: url.path) {
+            let bg = SKSpriteNode(texture: SKTexture(image: image), size: size)
+            bg.position = CGPoint(x: size.width / 2, y: size.height / 2)
+            bg.alpha = 0.34
+            bg.zPosition = -10
+            addChild(bg)
+        }
         notes = chart.notes
         rules = Rules(course: chart.course)
         soul = rules.soul(total: chart.total)
@@ -140,6 +152,7 @@ final class GameScene: SKScene {
             p.alpha = 0.55; p.zPosition = 1; addChild(p); pads.append(p)
         }
 
+        scoreLabel.fontName = UIFont(name: "TnT", size: 26) != nil ? "TnT" : "AvenirNext-Bold"
         scoreLabel.fontSize = 26; scoreLabel.horizontalAlignmentMode = .right
         scoreLabel.position = CGPoint(x: w - 20, y: h - 36); scoreLabel.text = "0"; scoreLabel.zPosition = 10
         addChild(scoreLabel)
@@ -163,10 +176,20 @@ final class GameScene: SKScene {
         mark.position = CGPoint(x: 70 + gaugeW * CGFloat(rules.gaugeClear), y: h - 30); mark.zPosition = 11
         addChild(mark)
 
-        texDon = circleTexture(.systemRed, noteR)
-        texKa = circleTexture(.systemTeal, noteR)
-        texBigDon = circleTexture(.systemRed, noteR * 1.45)
-        texBigKa = circleTexture(.systemTeal, noteR * 1.45)
+        let sheetURL = Bundle.main.url(forResource: "notes", withExtension: "png", subdirectory: "Original/img")
+            ?? Bundle.main.url(forResource: "notes", withExtension: "png")
+        if let sheetURL, let image = UIImage(contentsOfFile: sheetURL.path) {
+            let sheet = SKTexture(image: image)
+            texDon = SKTexture(rect: CGRect(x: 0, y: 0.25, width: 1, height: 0.25), in: sheet)
+            texKa = SKTexture(rect: CGRect(x: 0, y: 0.50, width: 1, height: 0.25), in: sheet)
+            texBigDon = texDon
+            texBigKa = texKa
+        } else {
+            texDon = circleTexture(.systemRed, noteR)
+            texKa = circleTexture(.systemTeal, noteR)
+            texBigDon = circleTexture(.systemRed, noteR * 1.45)
+            texBigKa = circleTexture(.systemTeal, noteR * 1.45)
+        }
         texBalloon = circleTexture(.systemOrange, noteR * 1.3)
     }
 
@@ -199,10 +222,18 @@ final class GameScene: SKScene {
         let node: SKNode
         switch n.type {
         case 0: node = SKSpriteNode(color: SKColor(white: 1, alpha: 0.5), size: CGSize(width: 2, height: laneH))
-        case 1: node = SKSpriteNode(texture: texDon)
-        case 2: node = SKSpriteNode(texture: texKa)
-        case 3: node = SKSpriteNode(texture: texBigDon)
-        case 4: node = SKSpriteNode(texture: texBigKa)
+        case 1:
+            let s = SKSpriteNode(texture: texDon, color: .systemRed, size: CGSize(width: noteR * 2, height: noteR * 2))
+            s.colorBlendFactor = 0.38; node = s
+        case 2:
+            let s = SKSpriteNode(texture: texKa, color: .systemTeal, size: CGSize(width: noteR * 2, height: noteR * 2))
+            s.colorBlendFactor = 0.38; node = s
+        case 3:
+            let s = SKSpriteNode(texture: texBigDon, color: .systemRed, size: CGSize(width: noteR * 2.9, height: noteR * 2.9))
+            s.colorBlendFactor = 0.38; node = s
+        case 4:
+            let s = SKSpriteNode(texture: texBigKa, color: .systemTeal, size: CGSize(width: noteR * 2.9, height: noteR * 2.9))
+            s.colorBlendFactor = 0.38; node = s
         case 5, 6:
             let len = CGFloat((n.endTime - n.time) * pxPerMs(n))
             let r = n.type == 6 ? noteR * 1.45 : noteR
@@ -226,9 +257,10 @@ final class GameScene: SKScene {
 
     override func update(_ currentTime: TimeInterval) {
         guard started, !finished else { return }
-        let t = nowMs()
+        let t = nowMs()                 // 판정 시계
+        let visualT = visualMs()        // 화면 표시 시계
 
-        while spawnPtr < spawnOrder.count && appear[spawnOrder[spawnPtr]] <= t {
+        while spawnPtr < spawnOrder.count && appear[spawnOrder[spawnPtr]] <= visualT {
             spawn(spawnOrder[spawnPtr]); spawnPtr += 1
         }
 
@@ -236,7 +268,7 @@ final class GameScene: SKScene {
         for (i, node) in nodes {
             let n = notes[i]
             let pps = pxPerMs(n)
-            var x = judgeX + CGFloat((n.time - t) * pps)
+            var x = judgeX + CGFloat((n.time - visualT) * pps)
             if n.type == 7 && t >= n.time && t <= n.endTime { x = judgeX }
             node.position.x = x
             if n.type == 7 && t > n.endTime { gone.append(i); continue }

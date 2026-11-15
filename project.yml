@@ -14,13 +14,21 @@ targets:
     platform: iOS
     sources:
       - Sources
-      - path: Resources
+      - path: Resources/neiro_1_don.ogg
         buildPhase: resources
+      - path: Resources/neiro_1_ka.ogg
+        buildPhase: resources
+      - path: Resources/Original
+        buildPhase: resources
+        type: folder
     info:
       path: Config/Info.plist
       properties:
         CFBundleDisplayName: Taiko
         UILaunchScreen: {}
+        UIAppFonts:
+          - Original/fonts/TnT.ttf
+          - Original/fonts/Kozuka.otf
         UIRequiresFullScreen: true
         UIStatusBarHidden: true
         UIFileSharingEnabled: true

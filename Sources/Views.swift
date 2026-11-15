@@ -67,7 +67,10 @@ struct SongListView: View {
                                     if let sub = s.subtitle, !sub.isEmpty {
                                         Text(sub).font(.caption).foregroundStyle(.secondary)
                                     }
-                                    Text(s.availableCourses.map { "\(courseLabel($0.name))★\($0.stars)" }.joined(separator: "  "))
+                                    Text(s.availableCourses.map { course in
+                                        let best = BestScoreStore.best(song: s, course: course.name)?.result.score
+                                        return "\(courseLabel(course.name))★\(course.stars)" + (best.map { " · PB \($0)" } ?? "")
+                                    }.joined(separator: "   "))
                                         .font(.caption2).foregroundStyle(.orange)
                                 }
                             }
@@ -108,8 +111,11 @@ struct SongListView: View {
 struct SettingsView: View {
     @AppStorage("baseURL") private var baseURL = kDefaultBase
     @AppStorage("serversJSON") private var serversJSON = "[\"https://cjdgrevival.com\"]"
-    @AppStorage("calMs") private var calMs = 0.0
+    @AppStorage("audioOffsetMs") private var audioOffsetMs = 0.0
+    @AppStorage("videoOffsetMs") private var videoOffsetMs = 0.0
+    @AppStorage("drumSoundsEnabled") private var drumSoundsEnabled = true
     @AppStorage("speedScale") private var speedScale = 1.0
+    @AppStorage("calMs") private var legacyCalMs = 0.0
     @Environment(\.dismiss) private var dismiss
     @State private var newServer = ""
 
@@ -161,15 +167,51 @@ struct SettingsView: View {
                         }
                     }
                 }
-                Section("판정 보정: \(Int(calMs)) ms") {
-                    Slider(value: $calMs, in: -150...150, step: 1)
-                    Text("노트가 소리보다 늦게 오는 느낌이면 −, 빠르면 +").font(.footnote).foregroundStyle(.secondary)
+                Section("싱크 캘리브레이션") {
+                    NavigationLink {
+                        CalibrationView()
+                    } label: {
+                        Label("자동 싱크 보정 시작", systemImage: "waveform.path")
+                    }
+                    Text("이어폰으로 오디오와 화면을 각각 40회 측정해 보정값을 저장합니다.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("현재 오디오 출력") {
+                    LabeledContent("출력 기기", value: AudioDiagnostics.currentOutputName)
+                    LabeledContent("시스템 보고 지연", value: String(format: "%.1f ms", AudioDiagnostics.reportedOutputLatencyMs))
+                    Text("시스템이 보고한 출력 지연 참고값입니다. 실제 체감 지연은 이어폰·무선 코덱 등에 따라 달라질 수 있습니다.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("지연 보정 · Audio Latency: \(Int(audioOffsetMs)) ms") {
+                    Slider(value: $audioOffsetMs, in: -200...500, step: 1)
+                    Text("시스템 출력 지연은 자동 반영됩니다. 이 값은 남는 오차를 추가 보정합니다. 이어폰으로 플레이하며 조정하세요.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("화면 보정 · Video Latency: \(Int(videoOffsetMs)) ms") {
+                    Slider(value: $videoOffsetMs, in: -200...500, step: 1)
+                    Text("노트가 화면에 나타나는 타이밍을 별도로 보정합니다.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("타격 효과음") {
+                    Toggle("돈·카 타격음 재생", isOn: $drumSoundsEnabled)
+                }
+                Section {
+                    Button("지연 설정 초기화", role: .destructive) {
+                        audioOffsetMs = 0
+                        videoOffsetMs = 0
+                    }
                 }
                 Section("노트 속도: ×\(String(format: "%.2f", speedScale))") {
                     Slider(value: $speedScale, in: 0.6...1.8, step: 0.05)
                 }
             }
             .navigationTitle("설정")
+            .onAppear {
+                if audioOffsetMs == 0 && legacyCalMs != 0 {
+                    audioOffsetMs = legacyCalMs
+                    legacyCalMs = 0
+                }
+            }
             .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("닫기") { dismiss() } } }
         }
     }
@@ -195,10 +237,12 @@ struct GameView: View {
     let song: SongInfo
     let course: String
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("calMs") private var calMs = 0.0
+    @AppStorage("audioOffsetMs") private var audioOffsetMs = 0.0
+    @AppStorage("videoOffsetMs") private var videoOffsetMs = 0.0
+    @AppStorage("drumSoundsEnabled") private var drumSoundsEnabled = true
     @AppStorage("speedScale") private var speedScale = 1.0
 
-    enum Phase { case loading(String), playing(GameScene), result(ResultData), failed(String) }
+    enum Phase { case loading(String), playing(GameScene), result(ResultData, Int), failed(String) }
     @State private var phase: Phase = .loading("준비 중…")
 
     var body: some View {
@@ -218,8 +262,8 @@ struct GameView: View {
                     }
                     Spacer()
                 }.padding(10)
-            case .result(let r):
-                ResultView(title: song.displayTitle, course: course, r: r) { dismiss() }
+            case .result(let r, let best):
+                ResultView(title: song.displayTitle, course: course, r: r, bestScore: best) { dismiss() }
             case .failed(let m):
                 VStack(spacing: 14) {
                     Text(m).foregroundColor(.white).multilineTextAlignment(.center)
@@ -245,11 +289,18 @@ struct GameView: View {
                 return (ch, try AudioDecoder.decode(url: f.audio))
             }.value
             let audio = try GameAudio(music: buffer)
+            audio.drumSoundsEnabled = drumSoundsEnabled
             let b = UIScreen.main.bounds.size
             let sc = GameScene(size: CGSize(width: max(b.width, b.height), height: min(b.width, b.height)))
             sc.scaleMode = .aspectFill
-            sc.chart = chart; sc.audio = audio; sc.calMs = calMs; sc.speedScale = speedScale
-            sc.onFinish = { r in phase = .result(r) }
+            sc.chart = chart; sc.audio = audio
+            sc.audioOffsetMs = audioOffsetMs
+            sc.videoOffsetMs = videoOffsetMs
+            sc.speedScale = speedScale
+            sc.onFinish = { r in
+                let record = BestScoreStore.save(r, song: song, course: course)
+                phase = .result(r, record.result.score)
+            }
             phase = .playing(sc)
         } catch {
             phase = .failed("불러오기 실패: \(error.localizedDescription)")
@@ -261,6 +312,7 @@ struct ResultView: View {
     let title: String
     let course: String
     let r: ResultData
+    let bestScore: Int
     let close: () -> Void
 
     var body: some View {
@@ -269,6 +321,7 @@ struct ResultView: View {
             Text("\(courseLabel(course)) – \(r.cleared ? "CLEAR" : "FAILED")")
                 .font(.headline).foregroundColor(r.cleared ? .yellow : .gray)
             Text("\(r.score)").font(.system(size: 44, weight: .heavy, design: .rounded))
+            Text("최고 기록  \(bestScore)").font(.subheadline).foregroundColor(r.score >= bestScore ? .yellow : .secondary)
             HStack(spacing: 24) {
                 stat("GOOD", r.good); stat("OK", r.ok); stat("BAD", r.bad); stat("MISS", r.miss)
                 stat("연타", r.rollHits); stat("최대콤보", r.maxCombo)
