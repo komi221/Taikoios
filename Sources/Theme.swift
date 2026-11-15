@@ -20,6 +20,16 @@ enum Theme {
         seg.backgroundColor = UIColor(white: 0.18, alpha: 1)
         seg.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .normal)
         seg.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .selected)
+
+        // 상단바 제목은 SwiftUI 커스텀 항목 대신 UIKit 기본 제목에 글꼴만 입힌다
+        let nav = UINavigationBarAppearance()
+        nav.configureWithOpaqueBackground()
+        nav.backgroundColor = UIColor(red: 250 / 255, green: 69 / 255, blue: 41 / 255, alpha: 1)
+        nav.titleTextAttributes = [.foregroundColor: UIColor.white, .font: Fonts.tntFont(24)]
+        let bar = UINavigationBar.appearance()
+        bar.standardAppearance = nav
+        bar.compactAppearance = nav
+        bar.scrollEdgeAppearance = nav
     }
 }
 
