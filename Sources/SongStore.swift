@@ -53,8 +53,7 @@ final class SongStore: ObservableObject {
 
     private func loadRemoteCache() {
         remote = []
-        if let d = try? Data(contentsOf: listFile),
-           let l = try? JSONDecoder().decode([Lossy<SongInfo>].self, from: d) { remote = l.compactMap { $0.value } }
+        if let d = try? Data(contentsOf: listFile) { remote = SongInfo.parseList(d).songs }
     }
 
     /// 설정에서 서버를 바꿨을 때: 그 서버의 저장된 목록을 먼저 보여주고 새로 받아온다.
@@ -107,17 +106,17 @@ final class SongStore: ObservableObject {
         Task { await loadCategories() }
         do {
             let data = try await fetch(baseURL.appendingPathComponent("api/songs"))
-            let decoded = try JSONDecoder().decode([Lossy<SongInfo>].self, from: data)
-            let list = decoded.compactMap { $0.value }
-            let skipped = decoded.count - list.count
+            let parsed = SongInfo.parseList(data)
+            if parsed.songs.isEmpty { throw SimpleError("곡 목록을 읽지 못했어요 (\(parsed.sample))") }
             try? data.write(to: listFile)
-            remote = list
+            remote = parsed.songs
             cachedCandidates = []
-            status = "곡 \(list.count)개 불러옴" + (skipped > 0 ? " · 데이터 오류 \(skipped)개 제외" : "")
+            status = "곡 \(parsed.songs.count)개 불러옴" + (parsed.skipped > 0 ? " · 데이터 오류 \(parsed.skipped)개 제외 (예: \(parsed.sample))" : "")
         } catch {
+            let why = error.localizedDescription
             status = remote.isEmpty
-                ? "서버 연결 실패 – 오른쪽 위 가져오기로 TJA+음원을 직접 넣어 주세요"
-                : "서버 연결 실패 – 저장된 목록 사용 중"
+                ? "서버 연결/읽기 실패: \(why) – 오른쪽 위 가져오기로 TJA+음원을 직접 넣어 주세요"
+                : "서버 연결/읽기 실패(\(why)) – 저장된 목록 사용 중"
         }
         rebuild()
     }
@@ -289,36 +288,113 @@ final class SongStore: ObservableObject {
 
     // MARK: 직접 가져오기
 
+    private var importCounter = 0
+    private let audioExts = ["ogg", "mp3", "wav", "m4a", "aac", "flac"]
+
+    private func tjaWaveName(_ data: Data) -> String? {
+        for raw in TJAParser.decode(data).components(separatedBy: .newlines).prefix(80) {
+            let line = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}")))
+            if line.uppercased().hasPrefix("WAVE:") {
+                let v = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                return v.isEmpty ? nil : v
+            }
+        }
+        return nil
+    }
+
+    /// TJA 한 곡 + 음원 한 개를 앱 안으로 복사해 목록에 추가
+    private func importPair(tja: URL, audio: URL) throws -> String {
+        let data = try Data(contentsOf: tja)
+        let parsed = TJAParser.parse(TJAParser.decode(data))
+        if parsed.charts.isEmpty { throw SimpleError("\(tja.lastPathComponent): 악보(#START)를 찾지 못했어요") }
+        importCounter += 1
+        let id = -(Int(Date().timeIntervalSince1970 * 1000) % 1_000_000_000_000) - importCounter
+        let ext = audio.pathExtension.lowercased()
+        let dir = songsDir.appendingPathComponent("local/\(id)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try data.write(to: dir.appendingPathComponent("main.tja"))
+        let dest = dir.appendingPathComponent("main.\(ext)")
+        try? fm.removeItem(at: dest)
+        try fm.copyItem(at: audio, to: dest)
+        var courses: [String: CourseInfo?] = [:]
+        for (k, c) in parsed.charts { courses[k] = CourseInfo(branch: false, stars: c.level) }
+        let title = parsed.title.isEmpty ? tja.deletingPathExtension().lastPathComponent : parsed.title
+        locals.insert(SongInfo(id: id, title: title, subtitle: parsed.subtitle, title_lang: nil,
+                               category: "가져온 곡", category_id: -1, courses: courses,
+                               music_type: ext, order: 0), at: 0)
+        return title
+    }
+
+    /// 파일 묶음에서 TJA 와 음원을 짝지어 가져온다 (TJA 의 WAVE: 이름 → 같은 이름 → 하나뿐이면 그것)
+    private func importGroup(_ files: [URL]) -> (ok: [String], errors: [String]) {
+        let tjas = files.filter { $0.pathExtension.lowercased() == "tja" }
+        let audios = files.filter { audioExts.contains($0.pathExtension.lowercased()) }
+        var ok: [String] = [], errors: [String] = []
+        var used = Set<URL>()
+        for tja in tjas {
+            let data = try? Data(contentsOf: tja)
+            var match: URL?
+            if let d = data, let wave = tjaWaveName(d) {
+                let w = (wave as NSString).lastPathComponent.lowercased()
+                match = audios.first { $0.lastPathComponent.lowercased() == w }
+            }
+            if match == nil {
+                let base = tja.deletingPathExtension().lastPathComponent.lowercased()
+                match = audios.first { $0.deletingPathExtension().lastPathComponent.lowercased() == base && !used.contains($0) }
+            }
+            if match == nil, tjas.count == 1 { match = audios.first }
+            if match == nil, let only = audios.filter({ !used.contains($0) }).first, audios.count == tjas.count { match = only }
+            guard let audio = match else { errors.append("\(tja.lastPathComponent): 짝이 되는 음원이 없어요"); continue }
+            used.insert(audio)
+            do { ok.append(try importPair(tja: tja, audio: audio)) }
+            catch { errors.append("\(tja.lastPathComponent): \(error.localizedDescription)") }
+        }
+        return (ok, errors)
+    }
+
+    private func finishImport(ok: [String], errors: [String], received: [URL]) -> String {
+        if !ok.isEmpty {
+            do { try JSONEncoder().encode(locals).write(to: localFile, options: .atomic) }
+            catch { errors_append(error) }
+            rebuild()
+        }
+        var msg = ""
+        if !ok.isEmpty { msg += "가져옴 \(ok.count)곡: " + ok.prefix(5).joined(separator: ", ") + (ok.count > 5 ? " 외" : "") }
+        if !errors.isEmpty { msg += (msg.isEmpty ? "" : "\n") + "실패:\n" + errors.prefix(5).joined(separator: "\n") }
+        if ok.isEmpty && errors.isEmpty {
+            let names = received.prefix(8).map { $0.lastPathComponent }.joined(separator: ", ")
+            msg = "TJA 파일과 음원 파일(ogg/mp3/wav…)을 함께 선택해 주세요.\n받은 파일 \(received.count)개: \(names.isEmpty ? "없음" : names)"
+        }
+        status = msg.replacingOccurrences(of: "\n", with: " ")
+        return msg
+    }
+    private func errors_append(_ e: Error) { status = "목록 저장 실패: \(e.localizedDescription)" }
+
+    /// 파일 선택기로 고른 파일들 가져오기
     @discardableResult
     func importLocal(urls: [URL]) -> String {
         let scoped = urls.filter { $0.startAccessingSecurityScopedResource() }
         defer { scoped.forEach { $0.stopAccessingSecurityScopedResource() } }
-        let audioExts = ["ogg", "mp3", "wav", "m4a", "aac", "flac"]
-        guard let tja = urls.first(where: { $0.pathExtension.lowercased() == "tja" }),
-              let audio = urls.first(where: { audioExts.contains($0.pathExtension.lowercased()) }) else {
-            status = "TJA 파일과 음원 파일을 함께 선택해 주세요"; return status
+        let r = importGroup(urls)
+        return finishImport(ok: r.ok, errors: r.errors, received: urls)
+    }
+
+    /// 폴더 안의 모든 곡 폴더(TJA + 음원)를 한 번에 가져오기
+    @discardableResult
+    func importFolder(_ folder: URL) -> String {
+        let ok = folder.startAccessingSecurityScopedResource()
+        defer { if ok { folder.stopAccessingSecurityScopedResource() } }
+        var all: [URL] = []
+        if let en = fm.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+            for case let u as URL in en { all.append(u) }
         }
-        do {
-            let data = try Data(contentsOf: tja)
-            let parsed = TJAParser.parse(TJAParser.decode(data))
-            let id = -Int(Date().timeIntervalSince1970)
-            let ext = audio.pathExtension.lowercased()
-            let dir = songsDir.appendingPathComponent("local/\(id)", isDirectory: true)
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            try data.write(to: dir.appendingPathComponent("main.tja"))
-            try fm.copyItem(at: audio, to: dir.appendingPathComponent("main.\(ext)"))
-            var courses: [String: CourseInfo?] = [:]
-            for (k, c) in parsed.charts { courses[k] = CourseInfo(branch: false, stars: c.level) }
-            let title = parsed.title.isEmpty ? tja.deletingPathExtension().lastPathComponent : parsed.title
-            locals.insert(SongInfo(id: id, title: title, subtitle: parsed.subtitle, title_lang: nil,
-                                   category: "가져온 곡", category_id: -1, courses: courses,
-                                   music_type: ext, order: 0), at: 0)
-            try JSONEncoder().encode(locals).write(to: localFile)
-            status = "가져옴: \(title)"
-            rebuild()
-        } catch {
-            status = "가져오기 실패: \(error.localizedDescription)"
+        var okList: [String] = [], errs: [String] = []
+        let byDir = Dictionary(grouping: all) { $0.deletingLastPathComponent().path }
+        for (_, files) in byDir {
+            guard files.contains(where: { $0.pathExtension.lowercased() == "tja" }) else { continue }
+            let r = importGroup(files)
+            okList += r.ok; errs += r.errors
         }
-        return status
+        return finishImport(ok: okList, errors: errs, received: all)
     }
 }

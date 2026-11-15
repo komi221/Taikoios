@@ -91,6 +91,61 @@ extension SongInfo {
     }
 }
 
+extension SongInfo {
+    /// JSON 딕셔너리에서 직접 만든다 (id/order 가 숫자·문자열·null 무엇이든, 필드가 이상해도 곡을 버리지 않음)
+    static func make(from d: [String: Any]) -> SongInfo? {
+        func str(_ v: Any?) -> String? {
+            if let s = v as? String { return s.isEmpty ? nil : s }
+            if let n = v as? NSNumber { return n.stringValue }
+            return nil
+        }
+        func int(_ v: Any?) -> Int? {
+            if let n = v as? NSNumber { return n.intValue }
+            if let s = v as? String { return Int(s) }
+            return nil
+        }
+        let titleStr = str(d["title"])
+        guard let sidStr = str(d["id"]) ?? str(d["hash"]) ?? titleStr else { return nil }
+        let id: Int = { if let n = Int(sidStr), n >= 0 { return n }; return SongInfo.stableID(sidStr) }()
+        var tl: TitleLang? = nil
+        if let t = d["title_lang"] as? [String: Any] {
+            tl = TitleLang(ja: str(t["ja"]), en: str(t["en"]), ko: str(t["ko"]))
+        }
+        var courses: [String: CourseInfo?] = [:]
+        if let c = d["courses"] as? [String: Any] {
+            for (k, v) in c {
+                if let cd = v as? [String: Any] {
+                    courses[k] = CourseInfo(branch: cd["branch"] as? Bool, stars: int(cd["stars"]))
+                }
+            }
+        }
+        var s = SongInfo(id: id, title: titleStr ?? sidStr, subtitle: str(d["subtitle"]), title_lang: tl,
+                         category: str(d["category"]), category_id: int(d["category_id"]),
+                         courses: courses, music_type: str(d["music_type"]), order: int(d["order"]))
+        s.sid = sidStr
+        s.preview = (d["preview"] as? NSNumber)?.doubleValue
+        return s
+    }
+
+    /// 서버 응답 전체를 읽는다. (곡 목록, 못 읽은 개수, 못 읽은 항목 예시)
+    static func parseList(_ data: Data) -> (songs: [SongInfo], skipped: Int, sample: String) {
+        guard let any = try? JSONSerialization.jsonObject(with: data) else { return ([], 0, "JSON 형식이 아님") }
+        var arr = any as? [Any]
+        if arr == nil, let dict = any as? [String: Any] {
+            for k in ["songs", "data", "items", "results"] { if let a = dict[k] as? [Any] { arr = a; break } }
+        }
+        guard let list = arr else { return ([], 0, "목록 형식을 알 수 없음") }
+        var out: [SongInfo] = []
+        var skipped = 0
+        var sample = ""
+        for item in list {
+            if let d = item as? [String: Any], let s = make(from: d) { out.append(s) }
+            else { skipped += 1; if sample.isEmpty { sample = String(String(describing: item).prefix(100)) } }
+        }
+        return (out, skipped, sample)
+    }
+}
+
 struct CourseEntry: Identifiable {
     let name: String
     let stars: Int

@@ -21,7 +21,7 @@ struct PlayTarget: Identifiable {
 }
 
 struct SongListView: View {
-    enum ActiveSheet: String, Identifiable { case settings, share, picker; var id: String { rawValue } }
+    enum ActiveSheet: String, Identifiable { case settings, share, picker, folderPicker; var id: String { rawValue } }
 
     @StateObject private var store = SongStore()
     @AppStorage("baseURL") private var baseURL = kDefaultBase
@@ -103,6 +103,11 @@ struct SongListView: View {
             dict[c, default: []].append(s)
         }
         return order.map { SongGroup(name: $0, songs: dict[$0] ?? []) }
+    }
+
+    /// 선택창이 닫힌 뒤에 결과 알림을 띄운다 (닫히는 중에 띄우면 무시될 수 있음)
+    private func showImport(_ m: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { importMessage = m }
     }
 
     private var chosen: [SongInfo] { store.songs.filter { selected.contains(store.key(for: $0)) } }
@@ -278,7 +283,10 @@ struct SongListView: View {
                     }
                     if !selecting {
                         Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                        Button { sheet = .picker } label: { Image(systemName: "square.and.arrow.down") }
+                        Menu {
+                            Button { sheet = .picker } label: { Label("파일 선택 (TJA + 음원)", systemImage: "doc") }
+                            Button { sheet = .folderPicker } label: { Label("폴더 선택 (곡 폴더 통째로)", systemImage: "folder") }
+                        } label: { Image(systemName: "square.and.arrow.down") }
                         Button { sheet = .settings } label: { Image(systemName: "gearshape") }
                     }
                 }
@@ -321,9 +329,14 @@ struct SongListView: View {
             case .settings: SettingsView()
             case .share: ActivityShareSheet(items: shareURLs)
             case .picker:
-                DocumentPicker { urls in
+                DocumentPicker(folder: false) { urls in
                     sheet = nil
-                    if !urls.isEmpty { importMessage = store.importLocal(urls: urls) }
+                    if !urls.isEmpty { let m = store.importLocal(urls: urls); showImport(m) }
+                }
+            case .folderPicker:
+                DocumentPicker(folder: true) { urls in
+                    sheet = nil
+                    if let f = urls.first { let m = store.importFolder(f); showImport(m) }
                 }
             }
         }
@@ -333,10 +346,13 @@ struct SongListView: View {
 /// 파일 앱에서 TJA + 음원을 고르는 선택기. asCopy 로 앱 안에 복사해 오기 때문에
 /// 보안 범위(security-scoped) 접근 문제 없이 읽을 수 있다.
 struct DocumentPicker: UIViewControllerRepresentable {
+    var folder = false
     let onPick: ([URL]) -> Void
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let p = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
-        p.allowsMultipleSelection = true
+        let p = folder
+            ? UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+            : UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        p.allowsMultipleSelection = !folder
         p.delegate = context.coordinator
         return p
     }
