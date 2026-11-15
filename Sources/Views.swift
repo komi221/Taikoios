@@ -2,6 +2,7 @@ import SwiftUI
 import SpriteKit
 import AVFoundation
 import UniformTypeIdentifiers
+import UIKit
 
 @main
 struct TaikoApp: App {
@@ -27,6 +28,9 @@ struct SongListView: View {
     @State private var play: PlayTarget?
     @State private var showImporter = false
     @State private var showSettings = false
+    @State private var listFilter = "전체"
+    @State private var shareURLs: [URL] = []
+    @State private var showShare = false
     @ObservedObject private var scores = ScoreStore.shared
 
     private func scoreKey(_ s: SongInfo) -> String { "\(store.baseURL.absoluteString)#\(s.id)" }
@@ -73,10 +77,15 @@ struct SongListView: View {
 
     private var filtered: [SongInfo] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-        if q.isEmpty { return store.songs }
-        return store.songs.filter {
-            $0.title.lowercased().contains(q) || $0.displayTitle.lowercased().contains(q)
-                || ($0.title_lang?.ja ?? "").lowercased().contains(q)
+        return store.songs.filter { song in
+            let matchesQuery = q.isEmpty || song.title.lowercased().contains(q)
+                || song.displayTitle.lowercased().contains(q)
+                || (song.title_lang?.ja ?? "").lowercased().contains(q)
+            let key = store.key(for: song)
+            let matchesFilter = listFilter == "전체"
+                || (listFilter == "다운로드" && store.downloadedIDs.contains(key))
+                || (listFilter == "즐겨찾기" && store.favoriteIDs.contains(key))
+            return matchesQuery && matchesFilter
         }
     }
 
@@ -94,10 +103,17 @@ struct SongListView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    Picker("곡 필터", selection: $listFilter) {
+                        Text("전체").tag("전체")
+                        Text("다운로드").tag("다운로드")
+                        Text("즐겨찾기").tag("즐겨찾기")
+                    }.pickerStyle(.segmented)
+                }
                 if !store.status.isEmpty {
                     Text(store.status).font(.footnote).foregroundStyle(.secondary)
                 }
-                if query.trimmingCharacters(in: .whitespaces).isEmpty && !recentRows.isEmpty {
+                if listFilter == "전체" && query.trimmingCharacters(in: .whitespaces).isEmpty && !recentRows.isEmpty {
                     Section {
                         ForEach(recentRows) { row in
                             Button { play = PlayTarget(song: row.song, course: row.course) } label: {
@@ -118,20 +134,39 @@ struct SongListView: View {
                 ForEach(groups) { g in
                     Section {
                         ForEach(g.songs) { s in
-                            Button { dialogSong = s } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack {
-                                        Text(s.displayTitle).font(.custom(Fonts.kozuka, size: 19)).foregroundColor(.white)
-                                        if store.isDownloaded(s) {
-                                            Image(systemName: "arrow.down.circle.fill").foregroundStyle(.green).font(.caption)
+                            HStack(spacing: 10) {
+                                Button { dialogSong = s } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack {
+                                            Text(s.displayTitle).font(.custom(Fonts.kozuka, size: 19)).foregroundColor(.white)
+                                            if store.isDownloaded(s) { Image(systemName: "arrow.down.circle.fill").foregroundStyle(.green).font(.caption) }
                                         }
+                                        if let sub = s.subtitle, !sub.isEmpty {
+                                            Text(sub).font(.custom(Fonts.kozuka, size: 12)).foregroundColor(.white.opacity(0.8))
+                                        }
+                                        Text(s.availableCourses.map { "\(courseLabel($0.name))★\($0.stars)" }.joined(separator: "  "))
+                                            .font(.caption2).foregroundColor(.yellow)
+                                        scoreSummary(s)
                                     }
-                                    if let sub = s.subtitle, !sub.isEmpty {
-                                        Text(sub).font(.custom(Fonts.kozuka, size: 12)).foregroundColor(.white.opacity(0.8))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                }.buttonStyle(.plain)
+                                Button { store.toggleFavorite(s) } label: {
+                                    Image(systemName: store.isFavorite(s) ? "star.fill" : "star")
+                                        .foregroundStyle(store.isFavorite(s) ? .yellow : .white.opacity(0.8))
+                                }.buttonStyle(.borderless).accessibilityLabel("즐겨찾기")
+                                if store.isDownloaded(s) {
+                                    Button {
+                                        shareURLs = store.exportFiles(for: s); showShare = !shareURLs.isEmpty
+                                    } label: { Image(systemName: "square.and.arrow.up").foregroundStyle(.white) }
+                                    .buttonStyle(.borderless).accessibilityLabel("곡 내보내기")
+                                } else {
+                                    Button { Task { await store.download(s) } } label: {
+                                        if store.downloadingIDs.contains(store.key(for: s)) { ProgressView() }
+                                        else { Image(systemName: "arrow.down.circle").foregroundStyle(.white) }
                                     }
-                                    Text(s.availableCourses.map { "\(courseLabel($0.name))★\($0.stars)" }.joined(separator: "  "))
-                                        .font(.caption2).foregroundColor(.yellow)
-                                    scoreSummary(s)
+                                    .buttonStyle(.borderless).disabled(store.downloadingIDs.contains(store.key(for: s)) || s.id < 0)
+                                    .accessibilityLabel("곡 다운로드")
                                 }
                             }
                             .listRowBackground(store.categoryColors[s.category_id ?? -99]?.opacity(0.9) ?? Color(white: 0.15))
@@ -172,10 +207,19 @@ struct SongListView: View {
         }
         .fullScreenCover(item: $play) { t in GameView(store: store, song: t.song, course: t.course) }
         .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(isPresented: $showShare) { ActivityShareSheet(items: shareURLs) }
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.data], allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { store.importLocal(urls: urls) }
         }
     }
+}
+
+struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 /// 원본 bg-pattern-1.png 타일 배경
