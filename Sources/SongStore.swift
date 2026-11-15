@@ -16,15 +16,24 @@ final class SongStore: ObservableObject {
     private var cachedCandidates: [URL] = []
     private let fm = FileManager.default
 
+    // 곡마다 UserDefaults 를 읽고 URL 을 다시 만들면 목록이 길 때 화면이 매번 멈칫한다 → 한 번만 계산해 둔다
+    private var cachedBase: URL?
+    private var cachedCacheKey: String?
     var baseURL: URL {
+        if let c = cachedBase { return c }
         let s = (UserDefaults.standard.string(forKey: "baseURL") ?? kDefaultBase)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return URL(string: s) ?? URL(string: kDefaultBase)!
+        let u = URL(string: s) ?? URL(string: kDefaultBase)!
+        cachedBase = u
+        return u
     }
-    private var docs: URL { fm.urls(for: .documentDirectory, in: .userDomainMask)[0] }
+    private lazy var docs: URL = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
     private var songsDir: URL { docs.appendingPathComponent("songs", isDirectory: true) }
     private var cacheKey: String {
-        baseURL.absoluteString.map { $0.isLetter || $0.isNumber ? String($0) : "_" }.joined()
+        if let c = cachedCacheKey { return c }
+        let k = baseURL.absoluteString.map { $0.isLetter || $0.isNumber ? String($0) : "_" }.joined()
+        cachedCacheKey = k
+        return k
     }
     private var listFile: URL { docs.appendingPathComponent("songs_\(cacheKey).json") }
     private var localFile: URL { docs.appendingPathComponent("locals.json") }
@@ -58,6 +67,7 @@ final class SongStore: ObservableObject {
 
     /// 설정에서 서버를 바꿨을 때: 그 서버의 저장된 목록을 먼저 보여주고 새로 받아온다.
     func switchServer() {
+        cachedBase = nil; cachedCacheKey = nil
         cachedCandidates = []
         status = ""
         loadRemoteCache()
@@ -159,6 +169,7 @@ final class SongStore: ObservableObject {
 
     func isDownloaded(_ song: SongInfo) -> Bool {
         let f = files(for: song)
+        guard fm.fileExists(atPath: f.dir.path) else { return false }
         guard fm.fileExists(atPath: f.tja.path), fm.fileExists(atPath: f.audio.path) else { return false }
         return fileSize(f.tja) > 0 && fileSize(f.audio) > 0
     }
@@ -218,6 +229,55 @@ final class SongStore: ObservableObject {
         downloadingIDs.insert(k)
         defer { downloadingIDs.remove(k) }
         do { _ = try await ensureDownloaded(song); return true } catch { return false }
+    }
+
+    // MARK: 다운로드 용량 확인
+
+    /// 서버에 파일 크기만 물어본다 (HEAD → 안 되면 Range 0-0 의 Content-Range)
+    nonisolated private func remoteSize(of url: URL) async -> Int64? {
+        var head = URLRequest(url: url); head.httpMethod = "HEAD"; head.timeoutInterval = 15
+        if let (_, resp) = try? await URLSession.shared.data(for: head), let h = resp as? HTTPURLResponse,
+           (200...299).contains(h.statusCode) {
+            if let v = h.value(forHTTPHeaderField: "Content-Length"), let n = Int64(v), n > 0 { return n }
+            if h.expectedContentLength > 0 { return h.expectedContentLength }
+        }
+        var rng = URLRequest(url: url); rng.timeoutInterval = 15
+        rng.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        if let (_, resp) = try? await URLSession.shared.data(for: rng), let h = resp as? HTTPURLResponse,
+           let cr = h.value(forHTTPHeaderField: "Content-Range"), let slash = cr.lastIndex(of: "/"),
+           let n = Int64(cr[cr.index(after: slash)...]), n > 0 { return n }
+        return nil
+    }
+
+    /// 한 곡(TJA + 음원) 크기. 둘 중 하나라도 모르면 nil
+    nonisolated private func sizeOfSong(_ s: SongInfo, bases: [URL]) async -> Int64? {
+        var sum: Int64 = 0
+        for name in ["main.tja", "main.\(s.audioExt.lowercased())"] {
+            var got: Int64?
+            for base in bases {
+                let url = base.appendingPathComponent(s.serverID).appendingPathComponent(name)
+                if let n = await remoteSize(of: url) { got = n; break }
+            }
+            guard let g = got else { return nil }
+            sum += g
+        }
+        return sum
+    }
+
+    /// 받을 곡들의 총 용량(바이트)과, 크기를 알아내지 못한 곡 수
+    func estimateDownloadSize(_ list: [SongInfo]) async -> (bytes: Int64, unknown: Int) {
+        let todo = list.filter { $0.id >= 0 && !isDownloaded($0) }
+        let bases = await songsBaseCandidates()
+        var total: Int64 = 0, unknown = 0
+        var it = todo.makeIterator()
+        await withTaskGroup(of: Int64?.self) { group in
+            for _ in 0..<6 { if let s = it.next() { group.addTask { await self.sizeOfSong(s, bases: bases) } } }
+            while let r = await group.next() {
+                if let r { total += r } else { unknown += 1 }
+                if let s = it.next() { group.addTask { await self.sizeOfSong(s, bases: bases) } }
+            }
+        }
+        return (total, unknown)
     }
 
     /// 선택한 곡 일괄 다운로드 (동시에 3곡씩)
