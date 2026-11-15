@@ -7,6 +7,9 @@ final class SongStore: ObservableObject {
     @Published var status = ""
     @Published var loading = false
     @Published var categoryColors: [Int: Color] = [:]
+    @Published private(set) var downloadedIDs: Set<String> = []
+    @Published private(set) var favoriteIDs: Set<String> = []
+    @Published private(set) var downloadingIDs: Set<String> = []
 
     private var remote: [SongInfo] = []
     private var locals: [SongInfo] = []
@@ -26,7 +29,22 @@ final class SongStore: ObservableObject {
     private var listFile: URL { docs.appendingPathComponent("songs_\(cacheKey).json") }
     private var localFile: URL { docs.appendingPathComponent("locals.json") }
 
-    init() { loadCached() }
+    init() {
+        if let saved = UserDefaults.standard.array(forKey: "taikoFavorites") as? [String] { favoriteIDs = Set(saved) }
+        loadCached()
+    }
+
+    func key(for song: SongInfo) -> String {
+        let scope = song.id < 0 ? "local" : baseURL.absoluteString
+        return "\(scope)#\(song.id)"
+    }
+    func isFavorite(_ song: SongInfo) -> Bool { favoriteIDs.contains(key(for: song)) }
+    func toggleFavorite(_ song: SongInfo) {
+        let key = key(for: song)
+        if favoriteIDs.contains(key) { favoriteIDs.remove(key) } else { favoriteIDs.insert(key) }
+        UserDefaults.standard.set(Array(favoriteIDs), forKey: "taikoFavorites")
+    }
+
 
     private func loadRemoteCache() {
         remote = []
@@ -55,6 +73,7 @@ final class SongStore: ObservableObject {
             ($0.category_id ?? 0, $0.order ?? 0, $0.id) < ($1.category_id ?? 0, $1.order ?? 0, $1.id)
         }
         songs = locals + r
+        refreshDownloadedState()
     }
 
     private func fetch(_ url: URL) async throws -> Data {
@@ -80,11 +99,13 @@ final class SongStore: ObservableObject {
         Task { await loadCategories() }
         do {
             let data = try await fetch(baseURL.appendingPathComponent("api/songs"))
-            let list = try JSONDecoder().decode([Lossy<SongInfo>].self, from: data).compactMap { $0.value }
+            let decoded = try JSONDecoder().decode([Lossy<SongInfo>].self, from: data)
+            let list = decoded.compactMap { $0.value }
+            let skipped = decoded.count - list.count
             try? data.write(to: listFile)
             remote = list
             cachedSongsBase = nil
-            status = "곡 \(list.count)개 불러옴"
+            status = "곡 \(list.count)개 불러옴" + (skipped > 0 ? " · 데이터 오류 \(skipped)개 제외" : "")
         } catch {
             status = remote.isEmpty
                 ? "서버 연결 실패 – 오른쪽 위 가져오기로 TJA+음원을 직접 넣어 주세요"
@@ -114,12 +135,19 @@ final class SongStore: ObservableObject {
         let dir = song.id < 0
             ? songsDir.appendingPathComponent("local/\(song.id)", isDirectory: true)
             : songsDir.appendingPathComponent("\(cacheKey)/\(song.id)", isDirectory: true)
-        return (dir, dir.appendingPathComponent("main.tja"), dir.appendingPathComponent("main.\(song.audioExt)"))
+        return (dir, dir.appendingPathComponent("main.tja"), dir.appendingPathComponent("main.\(song.audioExt.lowercased())"))
+    }
+
+    private func fileSize(_ url: URL) -> Int {
+        guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber else { return 0 }
+        return size.intValue
     }
 
     func isDownloaded(_ song: SongInfo) -> Bool {
         let f = files(for: song)
-        return fm.fileExists(atPath: f.tja.path) && fm.fileExists(atPath: f.audio.path)
+        guard fm.fileExists(atPath: f.tja.path), fm.fileExists(atPath: f.audio.path) else { return false }
+        return fileSize(f.tja) > 0 && fileSize(f.audio) > 0
     }
 
     func ensureDownloaded(_ song: SongInfo) async throws -> (tja: URL, audio: URL) {
@@ -128,16 +156,49 @@ final class SongStore: ObservableObject {
         if song.id < 0 { throw SimpleError("가져온 곡 파일이 없어요. 다시 가져와 주세요") }
         try fm.createDirectory(at: f.dir, withIntermediateDirectories: true)
         let base = await songsBaseURL()
-        for (name, dest) in [("main.tja", f.tja), ("main.\(song.audioExt)", f.audio)] {
-            guard let url = URL(string: base.absoluteString + "\(song.id)/" + name) else { throw SimpleError("URL 오류") }
-            let (tmp, resp) = try await URLSession.shared.download(from: url)
-            if let h = resp as? HTTPURLResponse, h.statusCode != 200 {
-                throw SimpleError("\(name) 받기 실패 (HTTP \(h.statusCode))")
+        let tjaTmp = f.dir.appendingPathComponent("main.tja.part")
+        let audioTmp = f.dir.appendingPathComponent("main.\(song.audioExt.lowercased()).part")
+        defer { try? fm.removeItem(at: tjaTmp); try? fm.removeItem(at: audioTmp) }
+        for (name, temp) in [("main.tja", tjaTmp), ("main.\(song.audioExt.lowercased())", audioTmp)] {
+            let url = base.appendingPathComponent(String(song.id)).appendingPathComponent(name)
+            var request = URLRequest(url: url); request.timeoutInterval = 60
+            let (tmp, response) = try await URLSession.shared.download(for: request)
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                throw SimpleError("\(name) 받기 실패 (HTTP \(http.statusCode))")
             }
-            try? fm.removeItem(at: dest)
-            try fm.moveItem(at: tmp, to: dest)
+            guard fileSize(tmp) > 0 else { throw SimpleError("\(name) 파일이 비어 있어요") }
+            try? fm.removeItem(at: temp)
+            try fm.moveItem(at: tmp, to: temp)
         }
+        // 두 파일 모두 받은 뒤에만 기존 파일을 교체해 반쪽 다운로드를 방지
+        try? fm.removeItem(at: f.tja); try? fm.removeItem(at: f.audio)
+        try fm.moveItem(at: tjaTmp, to: f.tja)
+        try fm.moveItem(at: audioTmp, to: f.audio)
+        refreshDownloadedState()
         return (f.tja, f.audio)
+    }
+
+    func download(_ song: SongInfo) async {
+        let key = key(for: song)
+        guard !downloadingIDs.contains(key), !isDownloaded(song) else { return }
+        downloadingIDs.insert(key)
+        defer { downloadingIDs.remove(key) }
+        do {
+            _ = try await ensureDownloaded(song)
+            status = "다운로드 완료: \(song.displayTitle)"
+        } catch {
+            status = "다운로드 실패: \(song.displayTitle) · \(error.localizedDescription)"
+        }
+    }
+
+    func exportFiles(for song: SongInfo) -> [URL] {
+        guard isDownloaded(song) else { return [] }
+        let f = files(for: song)
+        return [f.tja, f.audio]
+    }
+
+    private func refreshDownloadedState() {
+        downloadedIDs = Set(songs.filter { isDownloaded($0) }.map { key(for: $0) })
     }
 
     // MARK: 직접 가져오기
