@@ -70,8 +70,18 @@ final class SongStore: ObservableObject {
 
     private func rebuild() {
         let r = remote.sorted {
-            ($0.category_id ?? 0, $0.order ?? 0, $0.id) < ($1.category_id ?? 0, $1.order ?? 0, $1.id)
-        }
+    let a = $0.category_id ?? 0
+    let b = $1.category_id ?? 0
+
+    if a != b { return a < b }
+
+    let ao = $0.order ?? ""
+    let bo = $1.order ?? ""
+
+    if ao != bo { return ao < bo }
+
+    return $0.id < $1.id
+}
         songs = locals + r
         refreshDownloadedState()
     }
@@ -131,12 +141,16 @@ final class SongStore: ObservableObject {
     }
 
     func files(for song: SongInfo) -> (dir: URL, tja: URL, audio: URL) {
-        // 가져온 곡(음수 id)은 서버와 무관, 서버 곡은 서버별 폴더 (서버끼리 id가 겹쳐도 안전)
-        let dir = song.id < 0
-            ? songsDir.appendingPathComponent("local/\(song.id)", isDirectory: true)
-            : songsDir.appendingPathComponent("\(cacheKey)/\(song.id)", isDirectory: true)
-        return (dir, dir.appendingPathComponent("main.tja"), dir.appendingPathComponent("main.\(song.audioExt.lowercased())"))
-    }
+    let dir = song.isLocal
+        ? songsDir.appendingPathComponent("local/\(song.id)", isDirectory: true)
+        : songsDir.appendingPathComponent("\(cacheKey)/\(song.id)", isDirectory: true)
+
+    return (
+        dir,
+        dir.appendingPathComponent("main.tja"),
+        dir.appendingPathComponent("main.\(song.audioExt)")
+    )
+}
 
     private func fileSize(_ url: URL) -> Int {
         guard let attrs = try? fm.attributesOfItem(atPath: url.path),
