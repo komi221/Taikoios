@@ -1,35 +1,57 @@
+
 import SwiftUI
 import UIKit
 
-// MARK: 루트 (타이틀 → 곡 목록)
+// MARK: - Root
 
 struct RootView: View {
     @State private var started = false
     @Environment(\.scenePhase) private var scenePhase
+
     var body: some View {
         ZStack {
             if started {
-                SongListView().transition(.opacity)
+                SongListView()
+                    .transition(.opacity)
             } else {
-                TitleView { withAnimation(.easeInOut(duration: 0.3)) { started = true } }
+                TitleView {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        started = true
+                    }
+                }
             }
         }
         .preferredColorScheme(.dark)
         .tint(Theme.gold)
+
         .onAppear {
-            // 첫 터치에서 멈칫하지 않도록 소리/BGM 을 미리 준비
-            Sfx.shared.preload(["se_don", "v_title", "se_gameclear", "se_gamefail", "v_results"])
+            Sfx.shared.preload([
+                "se_don",
+                "v_title",
+                "se_gameclear",
+                "se_gamefail",
+                "v_results"
+            ])
+
             Bgm.shared.prewarm("bgm_songsel")
-            SystemGuard.applyRepeatedly()
+            AppAudio.becomeActive()
         }
-        // 앱을 나가면 모든 소리 정지, 돌아오면 필요한 것만 다시 시작
+
         .onChange(of: scenePhase) { phase in
-            if phase == .background { AppAudio.enterBackground() }
-            else if phase == .active { AppAudio.becomeActive() }
+            switch phase {
+            case .active:
+                AppAudio.becomeActive()
+
+            case .background:
+                AppAudio.enterBackground()
+
+            case .inactive:
+                break
+
+            @unknown default:
+                break
+            }
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in AppAudio.enterBackground() }
-        .onReceive(NotificationCenter.default.publisher(for: UIScene.didEnterBackgroundNotification)) { _ in AppAudio.enterBackground() }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in AppAudio.becomeActive() }
     }
 }
 
