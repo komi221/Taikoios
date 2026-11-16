@@ -1,70 +1,148 @@
+
 import AVFoundation
 import UIKit
 
-/// 메뉴용 효과음 (ogg 는 stb_vorbis 로 디코딩)
-/// - 플레이어 노드를 미리 만들어 돌려 쓴다 (재생할 때마다 노드를 붙였다 떼면 오디오 그래프가 재구성돼서 멈칫함)
-/// - 디코딩은 항상 백그라운드, 오디오 세션 설정도 처음 한 번만
+// MARK: - Shared Audio Session
+
+enum SharedAudioSession {
+    static func activate() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default, options: [])
+        try session.setActive(true)
+    }
+
+    static func deactivate() {
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: .notifyOthersOnDeactivation
+        )
+    }
+}
+
+// MARK: - Sound Effects
+
 final class Sfx {
     static let shared = Sfx()
+
     private let engine = AVAudioEngine()
     private var cache: [String: AVAudioPCMBuffer] = [:]
     private var pools: [String: [AVAudioPlayerNode]] = [:]
     private var cursor: [String: Int] = [:]
-    private var loading: [String: Float] = [:]      // 디코딩 중인 이름 → 끝나면 바로 재생할 음량
+    private var loading: [String: Float] = [:]
+
     private var sessionReady = false
     private var suspended = false
-    private let decodeQueue = DispatchQueue(label: "taikoi.sfx.decode", qos: .userInitiated)
+    private var starting = false
 
-    private func formatKey(_ f: AVAudioFormat) -> String { "\(Int(f.sampleRate))-\(f.channelCount)" }
+    private let decodeQueue = DispatchQueue(
+        label: "taikoi.sfx.decode",
+        qos: .userInitiated
+    )
 
-    private func prepareSession() {
-        guard !sessionReady else { return }
-        let s = AVAudioSession.sharedInstance()
-        try? s.setCategory(.playback, mode: .default, options: [])
-        try? s.setActive(true)
-        sessionReady = true
+    private func formatKey(_ f: AVAudioFormat) -> String {
+        "\(Int(f.sampleRate))-\(f.channelCount)"
     }
 
-    private func pool(for f: AVAudioFormat) -> [AVAudioPlayerNode] {
-        let k = formatKey(f)
-        if let p = pools[k] { return p }
-        var arr: [AVAudioPlayerNode] = []
-        for _ in 0..<4 {
-            let n = AVAudioPlayerNode()
-            engine.attach(n)
-            engine.connect(n, to: engine.mainMixerNode, format: f)
-            arr.append(n)
+    private func prepareSession() -> Bool {
+        if sessionReady { return true }
+
+        do {
+            try SharedAudioSession.activate()
+            sessionReady = true
+            return true
+        } catch {
+            print("[SFX] Audio session activation failed: \(error)")
+            sessionReady = false
+            return false
         }
-        pools[k] = arr
-        return arr
     }
 
-    private func startEngineIfNeeded() {
-        guard !suspended else { return }
-        if !engine.isRunning { prepareSession(); try? engine.start() }
+    private func pool(for format: AVAudioFormat) -> [AVAudioPlayerNode] {
+        let key = formatKey(format)
+
+        if let existing = pools[key] {
+            return existing
+        }
+
+        var nodes: [AVAudioPlayerNode] = []
+
+        for _ in 0..<4 {
+            let node = AVAudioPlayerNode()
+            engine.attach(node)
+            engine.connect(
+                node,
+                to: engine.mainMixerNode,
+                format: format
+            )
+            nodes.append(node)
+        }
+
+        pools[key] = nodes
+        return nodes
     }
 
-    /// 메뉴/결과 화면에서 쓸 소리를 미리 디코딩하고 엔진도 미리 켜 둔다 (처음 재생할 때 끊기지 않게)
+    @discardableResult
+    private func startEngineIfNeeded() -> Bool {
+        guard !suspended else { return false }
+        guard !starting else { return false }
+        guard !engine.isRunning else { return true }
+
+        starting = true
+        defer { starting = false }
+
+        guard prepareSession() else { return false }
+
+        do {
+            engine.prepare()
+            try engine.start()
+
+            print("[SFX] Engine started")
+            return true
+        } catch {
+            print("[SFX] Engine start failed: \(error)")
+            engine.stop()
+            sessionReady = false
+            return false
+        }
+    }
+
     func preload(_ names: [String]) {
         decodeQueue.async { [weak self] in
             guard let self else { return }
-            self.prepareSession()
-            var done: [(String, AVAudioPCMBuffer)] = []
-            for n in names {
-                guard let u = Bundle.main.url(forResource: n, withExtension: "ogg"),
-                      let b = try? AudioDecoder.decode(url: u) else { continue }
-                done.append((n, b))
-            }
-            DispatchQueue.main.async {
-                for (n, b) in done where self.cache[n] == nil {
-                    self.cache[n] = b
-                    _ = self.pool(for: b.format)
+
+            var decoded: [(String, AVAudioPCMBuffer)] = []
+
+            for name in names {
+                guard
+                    let url = Bundle.main.url(
+                        forResource: name,
+                        withExtension: "ogg"
+                    ),
+                    let buffer = try? AudioDecoder.decode(url: url)
+                else {
+                    continue
                 }
+
+                decoded.append((name, buffer))
+            }
+
+            DispatchQueue.main.async {
+                for (name, buffer) in decoded {
+                    if self.cache[name] == nil {
+                        self.cache[name] = buffer
+                        _ = self.pool(for: buffer.format)
+                    }
+                }
+
                 self.startEngineIfNeeded()
-                // 디코딩을 기다리던 재생 요청 처리
-                for (n, vol) in self.loading where self.cache[n] != nil {
-                    self.loading[n] = nil
-                    self.play(n, volume: vol)
+
+                let pending = self.loading
+                self.loading.removeAll()
+
+                for (name, volume) in pending {
+                    if self.cache[name] != nil {
+                        self.play(name, volume: volume)
+                    }
                 }
             }
         }
@@ -72,141 +150,242 @@ final class Sfx {
 
     func play(_ name: String, volume: Float = 1) {
         guard !suspended else { return }
-        guard let buf = cache[name] else {
-            // 아직 디코딩 전: 메인 스레드에서 디코딩하지 않고 백그라운드에서 끝나면 재생
-            if loading[name] == nil {
-                loading[name] = volume
-                decodeQueue.async { [weak self] in
-                    guard let self else { return }
-                    self.prepareSession()
-                    guard let u = Bundle.main.url(forResource: name, withExtension: "ogg"),
-                          let b = try? AudioDecoder.decode(url: u) else {
-                        DispatchQueue.main.async { self.loading[name] = nil }
-                        return
-                    }
+
+        guard let buffer = cache[name] else {
+            guard loading[name] == nil else { return }
+
+            loading[name] = volume
+
+            decodeQueue.async { [weak self] in
+                guard let self else { return }
+
+                guard
+                    let url = Bundle.main.url(
+                        forResource: name,
+                        withExtension: "ogg"
+                    ),
+                    let buffer = try? AudioDecoder.decode(url: url)
+                else {
                     DispatchQueue.main.async {
-                        self.cache[name] = b
-                        _ = self.pool(for: b.format)
-                        let v = self.loading[name]
                         self.loading[name] = nil
-                        self.startEngineIfNeeded()
-                        if let v { self.play(name, volume: v) }
+                    }
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    self.cache[name] = buffer
+                    _ = self.pool(for: buffer.format)
+
+                    let requestedVolume = self.loading.removeValue(
+                        forKey: name
+                    )
+
+                    if let requestedVolume {
+                        self.play(name, volume: requestedVolume)
                     }
                 }
             }
+
             return
         }
-        startEngineIfNeeded()
-        let nodes = pool(for: buf.format)
-        let k = formatKey(buf.format)
-        let i = cursor[k, default: 0]
-        cursor[k] = (i + 1) % nodes.count
-        let node = nodes[i]
+
+        guard startEngineIfNeeded() else { return }
+
+        let nodes = pool(for: buffer.format)
+        guard !nodes.isEmpty else { return }
+
+        let key = formatKey(buffer.format)
+        let index = cursor[key, default: 0]
+
+        cursor[key] = (index + 1) % nodes.count
+
+        let node = nodes[index]
         node.volume = volume
-        node.scheduleBuffer(buf, at: nil, options: .interrupts, completionHandler: nil)
-        if !node.isPlaying { node.play() }
+        node.scheduleBuffer(
+            buffer,
+            at: nil,
+            options: .interrupts,
+            completionHandler: nil
+        )
+
+        if !node.isPlaying {
+            node.play()
+        }
     }
 
-    /// 앱이 백그라운드로 가면 소리를 완전히 끊는다
     func suspend() {
+        guard !suspended else { return }
+
         suspended = true
         sessionReady = false
-        for arr in pools.values { for n in arr { n.stop() } }
-        if engine.isRunning { engine.stop() }
+        loading.removeAll()
+
+        for nodes in pools.values {
+            for node in nodes {
+                node.stop()
+            }
+        }
+
+        engine.stop()
     }
 
     func resume() {
+        guard suspended else { return }
+
         suspended = false
-        startEngineIfNeeded()
+
+        guard startEngineIfNeeded() else {
+            suspended = true
+            return
+        }
     }
 }
 
-/// 곡 선택 BGM (mp3)
-/// - 설정의 "메인 화면 배경음악" 스위치(bgmOn)를 따른다
-/// - 앱이 백그라운드에 있는 동안은 멈추고, 돌아오면 이어서 재생
+// MARK: - Background Music
+
 final class Bgm {
     static let shared = Bgm()
+
     private var player: AVAudioPlayer?
     private var playerName: String?
-    private var wanted: String?          // 지금 틀어야 하는 곡 (스위치/백그라운드 때문에 못 틀고 있어도 기억)
+    private var wanted: String?
     private var suspended = false
 
-    static var enabled: Bool { UserDefaults.standard.object(forKey: "bgmOn") as? Bool ?? true }
+    static var enabled: Bool {
+        UserDefaults.standard.object(forKey: "bgmOn") as? Bool ?? true
+    }
 
-    /// mp3 를 미리 열어 둔다 (처음 재생할 때 화면 전환이 끊기지 않게)
     func prewarm(_ name: String) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let u = Bundle.main.url(forResource: name, withExtension: "mp3"),
-                  let p = try? AVAudioPlayer(contentsOf: u) else { return }
-            p.numberOfLoops = -1
-            p.volume = 0.6
-            p.prepareToPlay()
+            guard
+                let url = Bundle.main.url(
+                    forResource: name,
+                    withExtension: "mp3"
+                ),
+                let player = try? AVAudioPlayer(contentsOf: url)
+            else {
+                return
+            }
+
+            player.numberOfLoops = -1
+            player.volume = 0.6
+            player.prepareToPlay()
+
             DispatchQueue.main.async {
                 guard let self, self.player == nil else { return }
-                self.player = p; self.playerName = name
+
+                self.player = player
+                self.playerName = name
             }
+        }
+    }
+
+    @discardableResult
+    private func activateSession() -> Bool {
+        do {
+            try SharedAudioSession.activate()
+            return true
+        } catch {
+            print("[BGM] Session activation failed: \(error)")
+            return false
         }
     }
 
     func play(_ name: String) {
         wanted = name
+
         guard Bgm.enabled, !suspended else { return }
-        if playerName == name, let p = player {
-            if !p.isPlaying { activateSession(); p.play() }
+        guard activateSession() else { return }
+
+        if playerName == name, let player {
+            if !player.isPlaying {
+                player.play()
+            }
             return
         }
-        player?.stop(); player = nil; playerName = nil
-        guard let u = Bundle.main.url(forResource: name, withExtension: "mp3"),
-              let p = try? AVAudioPlayer(contentsOf: u) else { return }
-        activateSession()
-        p.numberOfLoops = -1
-        p.volume = 0.6
-        p.play()
-        player = p; playerName = name
+
+        player?.stop()
+        player = nil
+        playerName = nil
+
+        guard
+            let url = Bundle.main.url(
+                forResource: name,
+                withExtension: "mp3"
+            ),
+            let newPlayer = try? AVAudioPlayer(contentsOf: url)
+        else {
+            return
+        }
+
+        newPlayer.numberOfLoops = -1
+        newPlayer.volume = 0.6
+        newPlayer.prepareToPlay()
+
+        guard newPlayer.play() else { return }
+
+        player = newPlayer
+        playerName = name
     }
 
-    /// 의도적으로 멈춤 (게임 시작, 미리듣기 등)
     func stop() {
         wanted = nil
-        player?.pause()          // 닫지 않고 멈춰만 둬서 다음에 바로 이어 재생
+        player?.pause()
     }
 
-    /// 설정 스위치 변경
     func setEnabled(_ on: Bool, track: String = "bgm_songsel") {
-        if on { play(track) } else { player?.pause() }
+        if on {
+            play(track)
+        } else {
+            player?.pause()
+        }
     }
 
     func suspend() {
+        guard !suspended else { return }
+
         suspended = true
         player?.pause()
     }
 
     func resume() {
-        suspended = false
-        guard Bgm.enabled, let n = wanted else { return }
-        play(n)
-    }
+        guard suspended else { return }
 
-    private func activateSession() {
-        let s = AVAudioSession.sharedInstance()
-        try? s.setCategory(.playback, mode: .default, options: [])
-        try? s.setActive(true)
+        suspended = false
+
+        guard Bgm.enabled, let name = wanted else { return }
+        play(name)
     }
 }
 
-/// 앱이 화면에서 사라질 때 모든 소리를 끊고, 돌아오면 필요한 것만 다시 켠다.
+// MARK: - Application Audio Lifecycle
+
 enum AppAudio {
+    private static var isActive = false
+
     static func enterBackground() {
+        guard isActive else { return }
+
+        isActive = false
+
         Bgm.shared.suspend()
         Sfx.shared.suspend()
-        Task { @MainActor in PreviewPlayer.shared.stop(resumeBgm: false) }
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+
+        Task { @MainActor in
+            PreviewPlayer.shared.stop(resumeBgm: false)
+        }
+
+        SharedAudioSession.deactivate()
     }
 
     static func becomeActive() {
+        guard !isActive else { return }
+
+        isActive = true
+
         Sfx.shared.resume()
         Bgm.shared.resume()
+
         SystemGuard.applyRepeatedly()
     }
 }
-
