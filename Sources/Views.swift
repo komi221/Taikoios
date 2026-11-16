@@ -640,6 +640,8 @@ struct GameView: View {
 
     enum Phase { case loading(String), playing(GameScene), result(ResultData), failed(String) }
     @State private var phase: Phase = .loading("준비 중…")
+    @State private var paused = false
+    @State private var countdown = 0
 
     var body: some View {
         ZStack {
@@ -660,10 +662,14 @@ struct GameView: View {
                         Button { scene.abort(); dismiss() } label: {
                             Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(.white.opacity(0.7))
                         }
+                        Button { if scene.pauseGame() { paused = true } } label: {
+                            Image(systemName: "pause.circle.fill").font(.title2).foregroundColor(.white.opacity(0.7))
+                        }
                         Spacer()
                     }
                     Spacer()
                 }.padding(10)
+                if paused { pauseOverlay(scene) }
             case .result(let r):
                 ResultView(title: song.displayTitle, course: course, r: r) { dismiss() }
             case .failed(let m):
@@ -685,6 +691,49 @@ struct GameView: View {
         // 앱을 나가면(홈/앱 전환) 곡 소리가 계속 나지 않게 게임을 끝내고 곡 목록으로 돌아감
         .onChange(of: scenePhase) { p in if p == .background { leaveForBackground() } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in leaveForBackground() }
+    }
+
+    private func pauseOverlay(_ scene: GameScene) -> some View {
+        ZStack {
+            Color.black.opacity(0.6).ignoresSafeArea()
+            if countdown > 0 {
+                Text("\(countdown)").font(Theme.title(96)).foregroundColor(.white)
+            } else {
+                VStack(spacing: 14) {
+                    Text("일시정지").font(Theme.title(28)).foregroundColor(.white)
+                    Button { resumeWithCountdown(scene) } label: {
+                        Text("계속하기").font(Theme.title(18)).padding(.horizontal, 28).padding(.vertical, 10)
+                    }.buttonStyle(TaikoButtonStyle(prominent: true))
+                    Button { restart(scene) } label: {
+                        Text("처음부터").font(Theme.title(18)).padding(.horizontal, 28).padding(.vertical, 10)
+                    }.buttonStyle(TaikoButtonStyle())
+                    Button { scene.abort(); dismiss() } label: {
+                        Text("나가기").font(Theme.title(18)).padding(.horizontal, 28).padding(.vertical, 10)
+                    }.buttonStyle(TaikoButtonStyle())
+                }
+            }
+        }
+    }
+
+    /// 3·2·1 뒤에 이어서 재생 (그 사이에는 곡도 노트도 멈춰 있음)
+    private func resumeWithCountdown(_ scene: GameScene) {
+        guard countdown == 0 else { return }
+        Task { @MainActor in
+            for n in [3, 2, 1] {
+                countdown = n
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            countdown = 0
+            paused = false
+            scene.resumeGame()
+        }
+    }
+
+    private func restart(_ scene: GameScene) {
+        scene.abort()
+        paused = false; countdown = 0
+        phase = .loading("준비 중…")
+        Task { await prepare() }
     }
 
     private func leaveForBackground() {
