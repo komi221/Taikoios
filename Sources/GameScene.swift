@@ -63,6 +63,8 @@ final class DigitNode: SKNode {
     private let anchor: Anchor
     private var lastValue = -1
     private var lastAdvance: CGFloat = -1
+    private var lastCount = -1
+    private var shown: [Int] = []          // 자릿수 스프라이트마다 지금 붙어 있는 숫자 (-1 = 없음)
 
     init(textures: [SKTexture], cell: CGSize, capacity: Int, anchor: Anchor, bottomAligned: Bool = false) {
         self.textures = textures
@@ -75,31 +77,44 @@ final class DigitNode: SKNode {
             addChild(s)
             sprites.append(s)
         }
+        shown = Array(repeating: -1, count: capacity)
     }
     required init?(coder aDecoder: NSCoder) { fatalError() }
 
+    /// 문자열·배열을 만들지 않고 자릿수를 정수로 뽑는다. 바뀐 자릿수의 텍스처만 교체하고,
+    /// 자릿수(길이)나 간격이 바뀔 때만 위치를 다시 잡는다. (자릿수가 모자라면 아래쪽 자릿수만 표시)
     func set(_ value: Int, advance: CGFloat) {
         if value == lastValue && advance == lastAdvance { return }
-        lastValue = value; lastAdvance = advance
-        let digits = Array(String(max(0, value)).compactMap { $0.wholeNumberValue }.suffix(sprites.count))
-        let n = digits.count
-        for i in 0..<sprites.count {
-            if i < n {
-                let sp = sprites[i]
+        let v = max(0, value)
+        var n = 1, q = v / 10
+        while q > 0 { n += 1; q /= 10 }
+        n = min(n, sprites.count)
+        let relayout = n != lastCount || advance != lastAdvance
+        lastValue = value; lastAdvance = advance; lastCount = n
+
+        var rest = v
+        var i = n - 1
+        while i >= 0 {
+            let d = rest % 10
+            rest /= 10
+            let sp = sprites[i]
+            if shown[i] != d { sp.texture = textures[d]; shown[i] = d }
+            if relayout {
                 sp.isHidden = false
-                sp.texture = textures[digits[i]]
                 let off: CGFloat = anchor == .right ? CGFloat(i - (n - 1)) : CGFloat(i) - CGFloat(n - 1) / 2
                 sp.position = CGPoint(x: off * advance, y: 0)
-            } else {
-                sprites[i].isHidden = true
             }
+            i -= 1
         }
+        if relayout { for j in n..<sprites.count { sprites[j].isHidden = true } }
     }
 
     /// 글자 텍스처 집합을 바꿀 때(흰색 ↔ 주황) 호출. 다음 set() 에서 다시 배치된다.
     func replaceTextures(_ t: [SKTexture]) {
         textures = t
         lastValue = -1
+        lastCount = -1
+        for k in 0..<shown.count { shown[k] = -1 }
     }
 }
 
