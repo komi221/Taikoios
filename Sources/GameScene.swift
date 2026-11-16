@@ -167,6 +167,8 @@ final class GameScene: SKScene {
     private var soul = (good: 0.0, ok: 0.0, bad: 0.0)
     private var started = false
     private var finished = false
+    private(set) var isGamePaused = false
+    private var needsMoveRebuild = false      // 재개 직후 첫 프레임에 노트 액션을 곡 시간 기준으로 다시 건다
     private var tex: GameTextures!
 
     // 악보 데이터 (평평한 배열: 프레임마다 구조체/딕셔너리를 건드리지 않기 위해)
@@ -578,7 +580,7 @@ final class GameScene: SKScene {
         let b = BalloonNode(tex); addChild(b); return b
     }
 
-    private func spawn(_ i: Int) {
+    private func spawn(_ i: Int, at t: Double) {
         let ty = nType[i]
         let node: SKNode
         switch ty {
@@ -598,10 +600,61 @@ final class GameScene: SKScene {
         nodeFor[i] = node
         activePos[i] = active.count
         active.append(i)
+        startMove(i, at: t)
+    }
+
+    /// 노트 한 개의 이동을 SKAction 으로 건다 (프레임마다 위치를 계산하지 않음).
+    /// 시작 위치와 남은 시간은 곡 시간(t)으로 계산하므로 판정 기준·지연 보정과 같은 시계를 쓴다.
+    /// 위치 공식: x(t) = slot.x + (노트 시각 − t) × 속도 → 판정선을 지나서도 같은 속도로 계속 흐른다.
+    /// 풍선은 시작~끝 구간에 판정선에서 멈춘다.
+    private func startMove(_ i: Int, at t: Double) {
+        guard let node = nodeFor[i] else { return }
+        node.removeAllActions()
+        let ty = nType[i]
+        let pps = nPps[i]                                   // px/ms
+        let slotX = slot.x
+        let tail: CGFloat = (ty == 5 || ty == 6) ? CGFloat((nEnd[i] - nTime[i]) * pps) : 0
+        let exitX = laneLeft - 120 - tail                   // 이 x 보다 왼쪽이면 화면에서 완전히 사라짐
+
+        var steps: [SKAction] = []
+        var fromX = slotX + CGFloat((nTime[i] - t) * pps)
+
+        if ty == 7 {
+            if t < nTime[i] {
+                node.position.x = fromX
+                let a = SKAction.moveTo(x: slotX, duration: max(0, (nTime[i] - t) / 1000))
+                a.timingMode = .linear
+                steps.append(a)
+                steps.append(.wait(forDuration: (nEnd[i] - nTime[i]) / 1000))
+                fromX = slotX
+            } else if t <= nEnd[i] {
+                node.position.x = slotX
+                steps.append(.wait(forDuration: (nEnd[i] - t) / 1000))
+                fromX = slotX
+            } else {
+                fromX = slotX + CGFloat((nEnd[i] - t) * pps)    // 터뜨리지 못한 풍선은 그대로 흘러감
+                node.position.x = fromX
+            }
+        } else {
+            node.position.x = fromX
+        }
+
+        let run = max(0, Double(fromX - exitX) / pps / 1000)
+        let out = SKAction.moveTo(x: exitX, duration: run)
+        out.timingMode = .linear
+        steps.append(out)
+        steps.append(.run { [weak self] in self?.removeNode(i) })
+        node.run(.sequence(steps))
+    }
+
+    /// 화면 위의 모든 노트 액션을 지금 곡 시간 기준으로 다시 건다 (재개할 때 한 번)
+    private func rebuildMoves(at t: Double) {
+        for i in active { startMove(i, at: t) }
     }
 
     private func removeNode(_ i: Int) {
         guard let node = nodeFor[i] else { return }
+        node.removeAllActions()
         node.isHidden = true
         switch nType[i] {
         case 0: poolBar.append(node as! SKSpriteNode)
@@ -622,8 +675,9 @@ final class GameScene: SKScene {
     // MARK: 프레임 업데이트
 
     override func update(_ currentTime: TimeInterval) {
-        guard started, !finished else { return }
+        guard started, !finished, !isGamePaused else { return }
         let t = nowMs()
+        if needsMoveRebuild { needsMoveRebuild = false; rebuildMoves(at: t) }
         let dt = lastFrame == 0 ? 16.7 : min(100, (currentTime - lastFrame) * 1000)
         lastFrame = currentTime
 
@@ -635,26 +689,9 @@ final class GameScene: SKScene {
         activeRolls.removeAll { nEnd[$0] < t || doneRolls.contains($0) }
 
         while spawnPtr < spawnOrder.count && appear[spawnOrder[spawnPtr]] <= t {
-            spawn(spawnOrder[spawnPtr]); spawnPtr += 1
+            spawn(spawnOrder[spawnPtr], at: t); spawnPtr += 1
         }
-
-        // 화면 위의 노트만 이동 (정렬/탐색 없이 활성 배열만 순회)
-        var k = 0
-        let slotX = slot.x
-        while k < active.count {
-            let i = active[k]
-            guard let node = nodeFor[i] else { k += 1; continue }
-            let ty = nType[i]
-            let pps = nPps[i]
-            var x = slotX + CGFloat((nTime[i] - t) * pps)
-            if ty == 7 {
-                if t >= nTime[i] && t <= nEnd[i] { x = slotX }
-                else if t > nEnd[i] { x = slotX + CGFloat((nEnd[i] - t) * pps) }   // 터뜨리지 못한 풍선은 그대로 흘러감
-            }
-            node.position.x = x
-            let right = (ty == 5 || ty == 6) ? x + CGFloat((nEnd[i] - nTime[i]) * pps) : x
-            if right < laneLeft - 120 { removeNode(i) } else { k += 1 }
-        }
+        // 노트 이동·제거는 spawn 때 건 SKAction 이 한다 (판정은 아래/터치에서 곡 시간으로만)
 
         // 놓친 노트
         while judgePtr < judgeList.count {
@@ -786,7 +823,7 @@ final class GameScene: SKScene {
     // MARK: 입력 (원본 ontouch 와 같은 판별: 북 중앙 타원 안 = 돈, 밖 = 카, 좌우는 화면 절반)
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard started, !finished else { return }
+        guard started, !finished, !isGamePaused else { return }
         for touch in touches {
             let p = touch.location(in: self)
             let px = p.x, py = H - p.y
@@ -988,6 +1025,28 @@ final class GameScene: SKScene {
             clearMarkSprite.texture = tex.clearMark[cleared ? 1 : 0]
             soulSprite.texture = tex.soul[cleared ? 1 : 0]
         }
+    }
+
+    // MARK: 일시정지
+
+    /// 곡이 실제로 시작된 뒤에만 멈춘다 (시작 전 대기 구간이면 false).
+    @discardableResult
+    func pauseGame() -> Bool {
+        guard started, !finished, !isGamePaused, nowMs() > 0 else { return false }
+        isGamePaused = true
+        audio.pause()
+        isPaused = true            // 노트 이동·배경 등 모든 SKAction 정지
+        return true
+    }
+
+    /// 곡을 멈춘 위치부터 다시 재생. 노트 액션은 다음 프레임에 곡 시간 기준으로 다시 잡는다.
+    func resumeGame() {
+        guard isGamePaused, !finished else { return }
+        audio.resume()
+        lastFrame = 0
+        needsMoveRebuild = true
+        isGamePaused = false
+        isPaused = false
     }
 
     // MARK: 종료
