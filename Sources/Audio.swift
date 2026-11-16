@@ -1,273 +1,858 @@
+
 import AVFoundation
 import Darwin
+import Foundation
+
+// MARK: - Audio Decoder
 
 enum AudioDecoder {
+
     static func decode(url: URL) throws -> AVAudioPCMBuffer {
-        if url.pathExtension.lowercased() == "ogg" { return try decodeOgg(url) }
+        if url.pathExtension.lowercased() == "ogg" {
+            return try decodeOgg(url)
+        }
+
         let file = try AVAudioFile(forReading: url)
-        guard let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
-                                         frameCapacity: AVAudioFrameCount(file.length)) else {
+
+        guard file.length > 0,
+              let buffer = AVAudioPCMBuffer(
+                pcmFormat: file.processingFormat,
+                frameCapacity: AVAudioFrameCount(file.length)
+              ) else {
             throw SimpleError("음원 버퍼를 만들 수 없어요")
         }
-        try file.read(into: buf)
-        return buf
+
+        try file.read(into: buffer)
+
+        guard buffer.frameLength > 0 else {
+            throw SimpleError("음원 데이터가 비어 있어요")
+        }
+
+        return buffer
     }
 
     static func decodeOgg(_ url: URL) throws -> AVAudioPCMBuffer {
         let data = try Data(contentsOf: url)
-        var ch: Int32 = 0, sr: Int32 = 0
-        var out: UnsafeMutablePointer<Int16>? = nil
-        let n: Int32 = data.withUnsafeBytes { raw in
-            stb_vorbis_decode_memory(raw.bindMemory(to: UInt8.self).baseAddress, Int32(data.count), &ch, &sr, &out)
+
+        guard !data.isEmpty, data.count <= Int(Int32.max) else {
+            throw SimpleError("OGG 파일 크기가 올바르지 않아요")
         }
-        guard n > 0, let pcm = out, ch > 0 else { throw SimpleError("ogg 디코딩 실패") }
-        defer { free(pcm) }
-        guard let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(sr),
-                                      channels: AVAudioChannelCount(ch), interleaved: false),
-              let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(n)) else {
+
+        var channels: Int32 = 0
+        var sampleRate: Int32 = 0
+        var pcm: UnsafeMutablePointer<Int16>?
+
+        let frameCount: Int32 = data.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else {
+                return 0
+            }
+
+            return stb_vorbis_decode_memory(
+                base,
+                Int32(data.count),
+                &channels,
+                &sampleRate,
+                &pcm
+            )
+        }
+
+        guard frameCount > 0,
+              let pcm,
+              channels > 0,
+              sampleRate > 0 else {
+            throw SimpleError("OGG 디코딩 실패")
+        }
+
+        defer {
+            free(pcm)
+        }
+
+        guard
+            let format = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: Double(sampleRate),
+                channels: AVAudioChannelCount(channels),
+                interleaved: false
+            ),
+            let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(frameCount)
+            ),
+            let channelData = buffer.floatChannelData
+        else {
             throw SimpleError("오디오 포맷 오류")
         }
-        buf.frameLength = AVAudioFrameCount(n)
-        let channels = Int(ch), frames = Int(n)
-        for c in 0..<channels {
-            let dst = buf.floatChannelData![c]
-            for i in 0..<frames { dst[i] = Float(pcm[i * channels + c]) / 32768.0 }
+
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+
+        let channelCount = Int(channels)
+        let frames = Int(frameCount)
+
+        for channel in 0..<channelCount {
+            let destination = channelData[channel]
+
+            for frame in 0..<frames {
+                let sample = pcm[frame * channelCount + channel]
+                destination[frame] = Float(sample) / 32768.0
+            }
         }
-        return buf
+
+        return buffer
     }
 }
+
+
+// MARK: - Shared Format
+
+private enum AudioFormatKey {
+
+    static func make(_ format: AVAudioFormat) -> String {
+        "\(Int(format.sampleRate))-\(format.channelCount)"
+    }
+}
+
+
+// MARK: - Audio Session
+
+private enum GameAudioSession {
+
+    static func activate() throws {
+        let session = AVAudioSession.sharedInstance()
+
+        try session.setCategory(
+            .playback,
+            mode: .default,
+            options: []
+        )
+
+        try session.setActive(true)
+    }
+}
+
+
+// MARK: - SFX Pool
 
 final class SfxPool {
+
     private let players: [AVAudioPlayerNode]
     private let buffer: AVAudioPCMBuffer
-    private var idx = 0
 
-    init(engine: AVAudioEngine, buffer: AVAudioPCMBuffer, count: Int = 4) {
+    private var index = 0
+
+    init(
+        engine: AVAudioEngine,
+        buffer: AVAudioPCMBuffer,
+        count: Int = 4
+    ) {
         self.buffer = buffer
-        var ps: [AVAudioPlayerNode] = []
-        for _ in 0..<count {
-            let p = AVAudioPlayerNode()
-            engine.attach(p)
-            engine.connect(p, to: engine.mainMixerNode, format: buffer.format)
-            ps.append(p)
+
+        var nodes: [AVAudioPlayerNode] = []
+
+        for _ in 0..<max(1, count) {
+            let player = AVAudioPlayerNode()
+
+            engine.attach(player)
+
+            engine.connect(
+                player,
+                to: engine.mainMixerNode,
+                format: buffer.format
+            )
+
+            nodes.append(player)
         }
-        players = ps
+
+        players = nodes
     }
 
-    func startAll() { players.forEach { $0.play() } }
+    func startAll() {
+        // 재생할 버퍼가 있을 때만 각 노드를 시작한다.
+    }
 
     func play() {
-        let p = players[idx]
-        idx = (idx + 1) % players.count
-        p.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
-        if !p.isPlaying { p.play() }
+        guard !players.isEmpty else { return }
+
+        let player = players[index]
+
+        index = (index + 1) % players.count
+
+        player.scheduleBuffer(
+            buffer,
+            at: nil,
+            options: .interrupts,
+            completionHandler: nil
+        )
+
+        if !player.isPlaying {
+            player.play()
+        }
+    }
+
+    func stopAll() {
+        for player in players {
+            player.stop()
+        }
     }
 }
 
-/// 타격음(돈/카) 전용 믹서. 타격할 때 AVAudioEngine 의 scheduleBuffer 를 부르지 않고,
-/// 미리 복사해 둔 샘플을 오디오 스레드의 렌더 콜백이 직접 섞는다.
-/// 메인 스레드는 "이 소리를 시작해라" 표시만 남기므로(잠금 몇 마이크로초) 연타해도 멈칫하지 않는다.
+
+// MARK: - Hit Synth
+
+/// 돈 / 카 전용 저지연 렌더링 엔진.
+/// AVAudioPlayerNode의 반복적인 예약 호출 대신
+/// AVAudioSourceNode에서 샘플을 직접 믹싱한다.
+
 final class HitSynth {
-    private struct Voice { var sound: Int32 = 0; var pos: Int = 0; var active: Bool = false }
-    private struct Sound { var p0: UnsafeMutablePointer<Float>; var p1: UnsafeMutablePointer<Float>; var frames: Int }
+
+    private struct Voice {
+        var sound: Int32 = 0
+        var position: Int = 0
+        var active: Bool = false
+    }
+
+    private struct Sound {
+        var left: UnsafeMutablePointer<Float>
+        var right: UnsafeMutablePointer<Float>
+        var frames: Int
+    }
 
     private static let maxVoices = 16
-    private let lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
-    private let voices = UnsafeMutablePointer<Voice>.allocate(capacity: HitSynth.maxVoices)
+
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private let voices: UnsafeMutablePointer<Voice>
     private let sounds: UnsafeMutablePointer<Sound>
+
     private let soundCount: Int
+
     private var owned: [UnsafeMutablePointer<Float>] = []
     private var freed = false
+
     private(set) var node: AVAudioSourceNode!
     let format: AVAudioFormat
 
-    /// 모든 버퍼가 같은 포맷(float32, 1~2채널)일 때만 만들 수 있다. 아니면 nil.
     init?(buffers: [AVAudioPCMBuffer]) {
-        guard let first = buffers.first else { return nil }
-        let fmt = first.format
-        guard fmt.commonFormat == .pcmFormatFloat32, !fmt.isInterleaved, fmt.channelCount >= 1, fmt.channelCount <= 2 else { return nil }
-        for b in buffers where b.format.sampleRate != fmt.sampleRate || b.format.channelCount != fmt.channelCount || b.floatChannelData == nil { return nil }
-        format = fmt
-        soundCount = buffers.count
-        sounds = UnsafeMutablePointer<Sound>.allocate(capacity: buffers.count)
-        self.lock.initialize(to: os_unfair_lock())
-        self.voices.initialize(repeating: Voice(), count: HitSynth.maxVoices)
 
-        for (i, b) in buffers.enumerated() {
-            let n = Int(b.frameLength)
-            let data = b.floatChannelData!
-            let p0 = UnsafeMutablePointer<Float>.allocate(capacity: max(n, 1))
-            p0.update(from: data[0], count: n)
-            owned.append(p0)
-            var p1 = p0
-            if fmt.channelCount == 2 {
-                p1 = UnsafeMutablePointer<Float>.allocate(capacity: max(n, 1))
-                p1.update(from: data[1], count: n)
-                owned.append(p1)
-            }
-            (self.sounds + i).initialize(to: Sound(p0: p0, p1: p1, frames: n))
+        guard let first = buffers.first else {
+            return nil
         }
 
-        let lock = self.lock, voices = self.voices, sounds = self.sounds
-        let maxV = HitSynth.maxVoices
-        node = AVAudioSourceNode(format: fmt) { _, _, frameCount, abl -> OSStatus in
-            let list = UnsafeMutableAudioBufferListPointer(abl)
-            let n = Int(frameCount)
-            for ci in 0..<list.count {
-                if let d = list[ci].mData { memset(d, 0, n * MemoryLayout<Float>.size) }
+        let format = first.format
+
+        guard
+            format.commonFormat == .pcmFormatFloat32,
+            !format.isInterleaved,
+            format.channelCount >= 1,
+            format.channelCount <= 2
+        else {
+            return nil
+        }
+
+        for buffer in buffers {
+            guard
+                buffer.format.sampleRate == format.sampleRate,
+                buffer.format.channelCount == format.channelCount,
+                buffer.format.commonFormat == .pcmFormatFloat32,
+                !buffer.format.isInterleaved,
+                buffer.floatChannelData != nil,
+                buffer.frameLength > 0
+            else {
+                return nil
             }
-            os_unfair_lock_lock(lock)
-            for v in 0..<maxV where voices[v].active {
-                let snd = sounds[Int(voices[v].sound)]
-                let m = min(n, snd.frames - voices[v].pos)
-                if m > 0 {
-                    for ci in 0..<list.count {
-                        guard let out = list[ci].mData?.assumingMemoryBound(to: Float.self) else { continue }
-                        let src = (ci == 0 ? snd.p0 : snd.p1) + voices[v].pos
-                        for i in 0..<m { out[i] += src[i] }
+        }
+
+        self.format = format
+        self.soundCount = buffers.count
+
+        lock = .allocate(capacity: 1)
+        voices = .allocate(capacity: Self.maxVoices)
+        sounds = .allocate(capacity: buffers.count)
+
+        lock.initialize(to: os_unfair_lock())
+
+        voices.initialize(
+            repeating: Voice(),
+            count: Self.maxVoices
+        )
+
+        for (index, buffer) in buffers.enumerated() {
+
+            let frames = Int(buffer.frameLength)
+            let channelData = buffer.floatChannelData!
+
+            let left = UnsafeMutablePointer<Float>.allocate(
+                capacity: frames
+            )
+
+            left.update(
+                from: channelData[0],
+                count: frames
+            )
+
+            owned.append(left)
+
+            var right = left
+
+            if format.channelCount == 2 {
+
+                right = UnsafeMutablePointer<Float>.allocate(
+                    capacity: frames
+                )
+
+                right.update(
+                    from: channelData[1],
+                    count: frames
+                )
+
+                owned.append(right)
+            }
+
+            (sounds + index).initialize(
+                to: Sound(
+                    left: left,
+                    right: right,
+                    frames: frames
+                )
+            )
+        }
+
+        let lockPointer = lock
+        let voicePointer = voices
+        let soundPointer = sounds
+        let maxVoiceCount = Self.maxVoices
+
+        node = AVAudioSourceNode(format: format) {
+            _, _, frameCount, audioBufferList -> OSStatus in
+
+            let output = UnsafeMutableAudioBufferListPointer(
+                audioBufferList
+            )
+
+            let count = Int(frameCount)
+
+            for channel in 0..<output.count {
+                if let data = output[channel].mData {
+                    memset(
+                        data,
+                        0,
+                        count * MemoryLayout<Float>.size
+                    )
+                }
+            }
+
+            os_unfair_lock_lock(lockPointer)
+
+            for voiceIndex in 0..<maxVoiceCount {
+
+                guard voicePointer[voiceIndex].active else {
+                    continue
+                }
+
+                let sound = soundPointer[
+                    Int(voicePointer[voiceIndex].sound)
+                ]
+
+                let position = voicePointer[voiceIndex].position
+
+                let remaining = sound.frames - position
+                let length = min(count, remaining)
+
+                if length > 0 {
+
+                    for channel in 0..<output.count {
+
+                        guard let destination = output[channel]
+                            .mData?
+                            .assumingMemoryBound(to: Float.self)
+                        else {
+                            continue
+                        }
+
+                        let source = (
+                            channel == 0
+                            ? sound.left
+                            : sound.right
+                        ) + position
+
+                        for sample in 0..<length {
+                            destination[sample] += source[sample]
+                        }
                     }
                 }
-                voices[v].pos += max(m, 0)
-                if voices[v].pos >= snd.frames { voices[v].active = false }
+
+                voicePointer[voiceIndex].position += max(length, 0)
+
+                if voicePointer[voiceIndex].position >= sound.frames {
+                    voicePointer[voiceIndex].active = false
+                }
             }
-            os_unfair_lock_unlock(lock)
+
+            os_unfair_lock_unlock(lockPointer)
+
             return noErr
         }
     }
 
-    /// index: 만들 때 넘긴 버퍼 순서
+    /// index: 초기화할 때 전달한 버퍼의 순서
     func trigger(_ index: Int) {
-        guard index >= 0, index < soundCount, !freed else { return }
-        os_unfair_lock_lock(lock)
-        var slot = -1, oldest = -1, oldestPos = -1
-        for v in 0..<HitSynth.maxVoices {
-            if !voices[v].active { slot = v; break }
-            if voices[v].pos > oldestPos { oldestPos = voices[v].pos; oldest = v }
+
+        guard
+            index >= 0,
+            index < soundCount,
+            !freed
+        else {
+            return
         }
-        if slot < 0 { slot = oldest }          // 꽉 찼으면 가장 오래된 소리를 끊고 사용
-        voices[slot] = Voice(sound: Int32(index), pos: 0, active: true)
+
+        os_unfair_lock_lock(lock)
+
+        var slot = -1
+        var oldest = -1
+        var oldestPosition = -1
+
+        for index in 0..<Self.maxVoices {
+
+            if !voices[index].active {
+                slot = index
+                break
+            }
+
+            if voices[index].position > oldestPosition {
+                oldestPosition = voices[index].position
+                oldest = index
+            }
+        }
+
+        if slot < 0 {
+            slot = oldest
+        }
+
+        if slot >= 0 {
+            voices[slot] = Voice(
+                sound: Int32(index),
+                position: 0,
+                active: true
+            )
+        }
+
         os_unfair_lock_unlock(lock)
     }
 
-    /// 엔진을 멈춘 뒤에만 호출할 것
-    func free() {
+    func reset() {
+
         guard !freed else { return }
+
+        os_unfair_lock_lock(lock)
+
+        for index in 0..<Self.maxVoices {
+            voices[index].active = false
+            voices[index].position = 0
+        }
+
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 반드시 오디오 엔진을 중지한 다음 호출
+    func free() {
+
+        guard !freed else { return }
+
         freed = true
-        for p in owned { p.deallocate() }
-        owned = []
-        sounds.deallocate(); voices.deallocate(); lock.deallocate()
+
+        for pointer in owned {
+            pointer.deallocate()
+        }
+
+        owned.removeAll()
+
+        sounds.deinitialize(count: soundCount)
+        sounds.deallocate()
+
+        voices.deinitialize(count: Self.maxVoices)
+        voices.deallocate()
+
+        lock.deinitialize(count: 1)
+        lock.deallocate()
     }
 }
 
-/// 콤보 음성/풍선 효과음 묶음. 소리마다 노드를 하나씩 만들면 재생 중이 아닌 노드까지 오디오 스레드가
-/// 계속 돌려서 부하가 커지고 터치 때 끊김이 생긴다 → 같은 포맷끼리 노드 2개를 공유한다.
+
+// MARK: - Voice Bank
+
 final class VoiceBank {
+
     private let buffers: [String: AVAudioPCMBuffer]
+
     private var nodes: [String: [AVAudioPlayerNode]] = [:]
     private var cursor: [String: Int] = [:]
 
-    private static func key(_ f: AVAudioFormat) -> String { "\(Int(f.sampleRate))-\(f.channelCount)" }
+    init(
+        engine: AVAudioEngine,
+        buffers: [String: AVAudioPCMBuffer]
+    ) {
 
-    init(engine: AVAudioEngine, buffers: [String: AVAudioPCMBuffer]) {
         self.buffers = buffers
+
         var formats: [String: AVAudioFormat] = [:]
-        for b in buffers.values { formats[VoiceBank.key(b.format)] = b.format }
-        for (k, f) in formats {
-            var arr: [AVAudioPlayerNode] = []
+
+        for buffer in buffers.values {
+            let key = AudioFormatKey.make(buffer.format)
+            formats[key] = buffer.format
+        }
+
+        for (key, format) in formats {
+
+            var players: [AVAudioPlayerNode] = []
+
             for _ in 0..<2 {
-                let p = AVAudioPlayerNode()
-                engine.attach(p)
-                engine.connect(p, to: engine.mainMixerNode, format: f)
-                arr.append(p)
+
+                let player = AVAudioPlayerNode()
+
+                engine.attach(player)
+
+                engine.connect(
+                    player,
+                    to: engine.mainMixerNode,
+                    format: format
+                )
+
+                players.append(player)
             }
-            nodes[k] = arr
+
+            nodes[key] = players
         }
     }
 
     func play(_ name: String) {
-        guard let b = buffers[name] else { return }
-        let k = VoiceBank.key(b.format)
-        guard let arr = nodes[k], !arr.isEmpty else { return }
-        let i = cursor[k, default: 0]
-        cursor[k] = (i + 1) % arr.count
-        let p = arr[i]
-        p.scheduleBuffer(b, at: nil, options: .interrupts, completionHandler: nil)
-        if !p.isPlaying { p.play() }
+
+        guard let buffer = buffers[name] else {
+            return
+        }
+
+        let key = AudioFormatKey.make(buffer.format)
+
+        guard
+            let players = nodes[key],
+            !players.isEmpty
+        else {
+            return
+        }
+
+        let index = cursor[key, default: 0]
+
+        cursor[key] = (index + 1) % players.count
+
+        let player = players[index]
+
+        player.scheduleBuffer(
+            buffer,
+            at: nil,
+            options: .interrupts,
+            completionHandler: nil
+        )
+
+        if !player.isPlaying {
+            player.play()
+        }
+    }
+
+    func stopAll() {
+
+        for players in nodes.values {
+            for player in players {
+                player.stop()
+            }
+        }
     }
 }
 
-/// 음악 + 효과음. 곡 시작 시각(startUptime)을 정확히 알고 있어서 판정 기준 시계로 쓴다.
+
+// MARK: - Game Audio
+
+/// 게임 음악 및 실시간 효과음 관리.
+/// 곡의 시작 시각을 판정 기준 시계로 사용한다.
+
 final class GameAudio {
+
     private let engine = AVAudioEngine()
+
     private let music = AVAudioPlayerNode()
     private let musicBuffer: AVAudioPCMBuffer
+
     private var don: SfxPool?
     private var ka: SfxPool?
+
     private var voices: VoiceBank?
     private var synth: HitSynth?
+
+    private var isStarted = false
+    private var isStopped = false
 
     private(set) var startUptime: Double = 0
     private(set) var latencyMs: Double = 0
 
-    /// extras: 게임 중 쓸 효과음/음성을 미리 디코딩해서 넘긴다 (게임 중 디코딩하면 끊김)
-    init(music buffer: AVAudioPCMBuffer, extras: [String: AVAudioPCMBuffer] = [:]) throws {
+    // MARK: Initialization
+
+    init(
+        music buffer: AVAudioPCMBuffer,
+        extras: [String: AVAudioPCMBuffer] = [:]
+    ) throws {
+
+        guard buffer.frameLength > 0 else {
+            throw SimpleError("음악 버퍼가 비어 있어요")
+        }
+
         musicBuffer = buffer
-        let s = AVAudioSession.sharedInstance()
-        try? s.setCategory(.playback, mode: .default, options: [])
-        try? s.setPreferredIOBufferDuration(0.005)
-        try? s.setActive(true)
+
+        let session = AVAudioSession.sharedInstance()
+
+        // 세션은 게임 시작 시 활성화한다.
+        // 초기화 단계에서는 포맷과 노드만 구성한다.
+        try? session.setPreferredIOBufferDuration(0.005)
 
         engine.attach(music)
-        engine.connect(music, to: engine.mainMixerNode, format: buffer.format)
-        var donBuf: AVAudioPCMBuffer?, kaBuf: AVAudioPCMBuffer?
-        if let u = Bundle.main.url(forResource: "neiro_1_don", withExtension: "ogg") { donBuf = try? AudioDecoder.decode(url: u) }
-        if let u = Bundle.main.url(forResource: "neiro_1_ka", withExtension: "ogg") { kaBuf = try? AudioDecoder.decode(url: u) }
-        if let d = donBuf, let k = kaBuf, let sy = HitSynth(buffers: [d, k]) {
-            engine.attach(sy.node)
-            engine.connect(sy.node, to: engine.mainMixerNode, format: sy.format)
-            synth = sy
-        } else {   // 포맷이 달라 합칠 수 없으면 예전 방식(노드 풀)으로
-            if let b = donBuf { don = SfxPool(engine: engine, buffer: b) }
-            if let b = kaBuf { ka = SfxPool(engine: engine, buffer: b) }
+
+        engine.connect(
+            music,
+            to: engine.mainMixerNode,
+            format: buffer.format
+        )
+
+        var donBuffer: AVAudioPCMBuffer?
+        var kaBuffer: AVAudioPCMBuffer?
+
+        if let url = Bundle.main.url(
+            forResource: "neiro_1_don",
+            withExtension: "ogg"
+        ) {
+            donBuffer = try? AudioDecoder.decode(url: url)
         }
-        voices = VoiceBank(engine: engine, buffers: extras)
+
+        if let url = Bundle.main.url(
+            forResource: "neiro_1_ka",
+            withExtension: "ogg"
+        ) {
+            kaBuffer = try? AudioDecoder.decode(url: url)
+        }
+
+        // 돈 / 카 샘플을 하나의 저지연 렌더 노드에서 처리한다.
+        if
+            let donBuffer,
+            let kaBuffer,
+            let hitSynth = HitSynth(
+                buffers: [donBuffer, kaBuffer]
+            )
+        {
+
+            engine.attach(hitSynth.node)
+
+            engine.connect(
+                hitSynth.node,
+                to: engine.mainMixerNode,
+                format: hitSynth.format
+            )
+
+            synth = hitSynth
+
+        } else {
+
+            // 포맷이 다르면 개별 노드 풀 사용
+            if let donBuffer {
+                don = SfxPool(
+                    engine: engine,
+                    buffer: donBuffer
+                )
+            }
+
+            if let kaBuffer {
+                ka = SfxPool(
+                    engine: engine,
+                    buffer: kaBuffer
+                )
+            }
+        }
+
+        voices = VoiceBank(
+            engine: engine,
+            buffers: extras
+        )
     }
 
-    /// 미리 만들어 둔 풀로 재생 (없으면 무시)
-    func play(_ name: String) { voices?.play(name) }
+    // MARK: Start
 
-    /// 필요한 효과음을 백그라운드에서 미리 디코딩하기 위한 헬퍼
-    static func decodeExtras(_ names: [String]) -> [String: AVAudioPCMBuffer] {
-        var out: [String: AVAudioPCMBuffer] = [:]
-        for n in names {
-            if let u = Bundle.main.url(forResource: n, withExtension: "ogg"), let b = try? AudioDecoder.decode(url: u) { out[n] = b }
-        }
-        return out
-    }
-
-    /// leadIn 초 뒤에 곡이 시작되도록 예약한다.
+    /// leadIn 초 뒤에 음악을 시작한다.
     func start(leadIn: Double = 1.5) {
-        do { try engine.start() } catch { return }
-        don?.startAll(); ka?.startAll()
-        let startHost = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: leadIn)
-        music.scheduleBuffer(musicBuffer, at: nil, options: [], completionHandler: nil)
-        music.play(at: AVAudioTime(hostTime: startHost))
-        startUptime = AVAudioTime.seconds(forHostTime: startHost)
-        let s = AVAudioSession.sharedInstance()
-        latencyMs = (s.outputLatency + s.ioBufferDuration) * 1000
+
+        guard !isStarted else {
+            return
+        }
+
+        guard !isStopped else {
+            print("[GameAudio] Already stopped")
+            return
+        }
+
+        guard leadIn >= 0 else {
+            print("[GameAudio] Invalid lead-in")
+            return
+        }
+
+        do {
+
+            try GameAudioSession.activate()
+
+            // 그래프 준비
+            engine.prepare()
+
+            // 이미 실행 중인 엔진은 재시작하지 않는다.
+            if !engine.isRunning {
+                try engine.start()
+            }
+
+            guard engine.isRunning else {
+                print("[GameAudio] Engine is not running")
+                return
+            }
+
+        } catch {
+
+            print("[GameAudio] Engine start failed: \(error)")
+
+            engine.stop()
+
+            return
+        }
+
+        isStarted = true
+
+        // 예약된 음악과 이전 효과음 상태 정리
+        music.stop()
+
+        synth?.reset()
+
+        let startHost = mach_absolute_time()
+            + AVAudioTime.hostTime(forSeconds: leadIn)
+
+        // 음악 예약
+        music.scheduleBuffer(
+            musicBuffer,
+            at: nil,
+            options: [],
+            completionHandler: nil
+        )
+
+        // 음악 시작 시각 예약
+        music.play(
+            at: AVAudioTime(hostTime: startHost)
+        )
+
+        startUptime = AVAudioTime.seconds(
+            forHostTime: startHost
+        )
+
+        // 출력 지연 측정
+        let session = AVAudioSession.sharedInstance()
+
+        latencyMs = (
+            session.outputLatency
+            + session.ioBufferDuration
+        ) * 1000
+
+        print("[GameAudio] Started")
+        print("[GameAudio] Latency: \(latencyMs) ms")
+        print("[GameAudio] Lead-in: \(leadIn) sec")
     }
 
-    func playSfx(don isDon: Bool) {
-        if let sy = synth { sy.trigger(isDon ? 0 : 1) } else { (isDon ? don : ka)?.play() }
+    // MARK: Voice
+
+    /// 미리 디코딩된 음성을 재생한다.
+    func play(_ name: String) {
+
+        guard isStarted, engine.isRunning else {
+            return
+        }
+
+        voices?.play(name)
     }
+
+    // MARK: Hit SFX
+
+    /// 돈 / 카 효과음
+    func playSfx(don isDon: Bool) {
+
+        guard isStarted, engine.isRunning else {
+            return
+        }
+
+        if let synth {
+            synth.trigger(isDon ? 0 : 1)
+        } else {
+            (isDon ? don : ka)?.play()
+        }
+    }
+
+    // MARK: Stop
 
     func stop() {
+
+        guard !isStopped else {
+            return
+        }
+
+        isStopped = true
+        isStarted = false
+
+        // 음악 중지
         music.stop()
+
+        // 음성 및 효과음 중지
+        voices?.stopAll()
+
+        don?.stopAll()
+        ka?.stopAll()
+
+        // 엔진 중지
         engine.stop()
+
+        // 렌더링 중인 샘플 초기화
+        synth?.reset()
+
+        print("[GameAudio] Stopped")
     }
 
+    // MARK: Decode Extras
+
+    /// 게임 시작 전에 효과음을 미리 디코딩한다.
+    static func decodeExtras(
+        _ names: [String]
+    ) -> [String: AVAudioPCMBuffer] {
+
+        var result: [String: AVAudioPCMBuffer] = [:]
+
+        for name in names {
+
+            guard let url = Bundle.main.url(
+                forResource: name,
+                withExtension: "ogg"
+            ) else {
+                continue
+            }
+
+            if let buffer = try? AudioDecoder.decode(url: url) {
+                result[name] = buffer
+            }
+        }
+
+        return result
+    }
+
+    // MARK: Deinitialization
+
     deinit {
-        if engine.isRunning { engine.stop() }
+
+        if engine.isRunning {
+            engine.stop()
+        }
+
         synth?.free()
     }
 }
