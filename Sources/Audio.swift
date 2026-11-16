@@ -1,4 +1,3 @@
-
 import AVFoundation
 import Darwin
 import Foundation
@@ -590,6 +589,9 @@ final class GameAudio {
     private(set) var startUptime: Double = 0
     private(set) var latencyMs: Double = 0
 
+    private(set) var isPaused = false
+    private var pausedPos: Double = 0      // 멈춘 순간의 곡 재생 위치(초)
+
     // MARK: Initialization
 
     init(
@@ -760,6 +762,35 @@ final class GameAudio {
         print("[GameAudio] Started")
         print("[GameAudio] Latency: \(latencyMs) ms")
         print("[GameAudio] Lead-in: \(leadIn) sec")
+    }
+
+    // MARK: Pause / Resume
+
+    /// 곡을 멈추고 그 순간의 재생 위치를 기억한다. (곡이 시작되기 전에는 호출하지 않는다)
+    func pause() {
+        guard isStarted, !isPaused, engine.isRunning else { return }
+
+        // 게임 시계와 같은 기준(렌더 시각)의 재생 위치. 샘플 위치를 읽을 수 없으면 시계로 계산.
+        pausedPos = ProcessInfo.processInfo.systemUptime - startUptime
+        if let nodeTime = music.lastRenderTime,
+           let playerTime = music.playerTime(forNodeTime: nodeTime),
+           playerTime.sampleRate > 0 {
+            pausedPos = Double(playerTime.sampleTime) / playerTime.sampleRate
+        }
+
+        music.pause()
+        voices?.stopAll()
+        isPaused = true
+    }
+
+    /// 멈춘 위치부터 다시 재생하고, 게임 시계(startUptime)를 그 위치에 맞춰 다시 잡는다.
+    func resume() {
+        guard isStarted, isPaused, engine.isRunning else { return }
+        isPaused = false
+
+        music.play()
+        let ioLead = AVAudioSession.sharedInstance().ioBufferDuration
+        startUptime = ProcessInfo.processInfo.systemUptime + ioLead - pausedPos
     }
 
     // MARK: Voice
