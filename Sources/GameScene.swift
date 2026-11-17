@@ -183,6 +183,13 @@ final class GameScene: SKScene {
     private var started = false
     private var finished = false
     private(set) var isGamePaused = false
+    // 화면용 시계 (vsync 격자 기준, 평균 위치는 기존 곡 시간과 같게 유지)
+    private let vsync = VsyncClock()
+    private var visBias = 0.0, visHasBias = false
+    private var tVisual = 0.0
+    // 입력은 기록만 하고, 판정·점수·효과는 update() 안에서 처리한다
+    private struct TapEvent { var isDon: Bool; var left: Bool; var uptime: Double }
+    private var tapQueue: [TapEvent] = []
     // 개발용 측정 (설정 > 개발용 측정 표시): 프레임이 길어진 횟수·최대 시간·마지막 위치
     var debugStats = false
     private var dbgLabel: SKLabelNode?
@@ -191,6 +198,8 @@ final class GameScene: SKScene {
     private var dbgShowDelay = 0.0, dbgShowProc = 0.0, dbgShowAfter = 0.0    // 직전 5초 구간 (화면에 표시)
     private var dbgWinStart = 0.0
     private var dbgTapPending = false
+    private var dbgPrevRaw = 0.0, dbgPrevVis = 0.0, dbgHavePrev = false
+    private var dbgJitRaw = 0.0, dbgJitVis = 0.0, dbgShowJitRaw = 0.0, dbgShowJitVis = 0.0   // 프레임 간격 흔들림
     private var tex: GameTextures!
 
     // 악보 데이터 (평평한 배열: 프레임마다 구조체/딕셔너리를 건드리지 않기 위해)
@@ -664,17 +673,23 @@ final class GameScene: SKScene {
 
     override func update(_ currentTime: TimeInterval) {
         guard started, !finished, !isGamePaused else { return }
-        let t = nowMs()
+        if !vsync.isRunning { vsync.start(fps: view?.preferredFramesPerSecond ?? 60) }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let tNow = songMs(uptime)          // 판정용: 정확한 현재 곡 시간
+        let t = visualMs(uptime)           // 화면용: 화면이 나가는 순간(vsync 격자) 기준의 고른 시계
+        tVisual = t
         let dt = lastFrame == 0 ? 16.7 : min(100, (currentTime - lastFrame) * 1000)
         lastFrame = currentTime
-        if debugStats { trackFrame(dt, t) }
+        if debugStats { trackFrame(dt, tNow, t) }
 
         // 현재 시각에 활성화된 연타/풍선만 유지한다. 매 터치마다 전체 악보를 순회하지 않는다.
         while rollCursor < rollList.count {
             let idx = rollList[rollCursor]
-            if nTime[idx] - 10 <= t { activeRolls.append(idx); rollCursor += 1 } else { break }
+            if nTime[idx] - 10 <= tNow { activeRolls.append(idx); rollCursor += 1 } else { break }
         }
-        activeRolls.removeAll { nEnd[$0] < t || doneRolls.contains($0) }
+        // 지난 프레임 사이에 들어온 터치를 여기서 처리 (터치 이벤트 쪽에서는 아무 계산도 하지 않는다)
+        processTaps()
+        activeRolls.removeAll { nEnd[$0] < tNow || doneRolls.contains($0) }
 
         while spawnPtr < spawnOrder.count && appear[spawnOrder[spawnPtr]] <= t {
             spawn(spawnOrder[spawnPtr]); spawnPtr += 1
@@ -703,7 +718,7 @@ final class GameScene: SKScene {
         while judgePtr < judgeList.count {
             let ni = judgeList[judgePtr]
             if judged[ni] { judgePtr += 1; continue }
-            if nTime[ni] + rules.bad < t {
+            if nTime[ni] + rules.bad < tNow {
                 judged[ni] = true; judgePtr += 1
                 combo = 0; res.miss += 1; addGauge(soul.bad); setDark(true); refreshHUD()
             } else { break }
@@ -826,6 +841,24 @@ final class GameScene: SKScene {
     }
     private func setDark(_ on: Bool) { darkTarget = on ? 0.5 : 0 }
 
+    /// 화면용 시각. 화면이 나갈 vsync 시각을 기준으로 하되, 평균 위치는 기존(현재 시각 기준)과 같게 맞춘다.
+    private func visualMs(_ now: Double) -> Double {
+        let g = vsync.nextGrid(after: now)
+        let off = g - now
+        if !visHasBias { visBias = off; visHasBias = true } else { visBias += 0.02 * (off - visBias) }
+        let v = songMs(g - visBias)
+        let real = songMs(now)
+        return abs(v - real) > 50 ? real : v          // 격자를 못 믿을 때는 현재 시각
+    }
+
+    private func processTaps() {
+        if tapQueue.isEmpty { return }
+        let s0 = debugStats ? ProcessInfo.processInfo.systemUptime : 0
+        for e in tapQueue { hit(isDon: e.isDon, left: e.left, uptime: e.uptime) }
+        tapQueue.removeAll(keepingCapacity: true)
+        if debugStats { dbgTapProc = max(dbgTapProc, (ProcessInfo.processInfo.systemUptime - s0) * 1000) }
+    }
+
     // MARK: 입력 (원본 ontouch 와 같은 판별: 북 중앙 타원 안 = 돈, 밖 = 카, 좌우는 화면 절반)
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -838,20 +871,19 @@ final class GameScene: SKScene {
             let c = touchCircle
             let dx = (px - c.cx) / c.rx, dy = (py - c.cy) / c.ry
             let isDon = py <= c.cy && dx * dx + dy * dy <= 1
-            hit(isDon: isDon, left: px < W / 2, uptime: touch.timestamp)
+            audio.playSfx(don: isDon)                                              // 소리만 즉시
+            tapQueue.append(TapEvent(isDon: isDon, left: px < W / 2, uptime: touch.timestamp))   // 나머지는 update 에서
         }
     }
 
     private func hit(isDon: Bool, left: Bool, uptime: Double) {
-        // 1) 소리부터 (미리 디코딩된 풀에서 바로 재생)
-        audio.playSfx(don: isDon)
-
-        // 2) 상태만 기록 — 화면 효과는 update() 가 시각을 보고 알아서 그림
+        // 판정은 터치가 일어난 정확한 곡 시간(t)으로, 화면 효과는 화면 시계(te)로 기록한다.
         let t = songMs(uptime)
+        let te = min(t, tVisual)
         let keyIdx = isDon ? (left ? 2 : 3) : (left ? 0 : 1)
-        keyTime[keyIdx] = t
-        if isDon { lastDonMs = t } else { lastKaMs = t }
-        touchMs = t
+        keyTime[keyIdx] = te
+        if isDon { lastDonMs = te } else { lastKaMs = te }
+        touchMs = te
 
         // 연타/풍선
         for ri in activeRolls {
@@ -870,7 +902,7 @@ final class GameScene: SKScene {
                 }
             } else {
                 res.score += ty == 6 ? 200 : 100          // 원본 checkDrumroll: 100점 (큰 연타는 ×2)
-                spawnFly(big: ty == 6, don: isDon, at: t)
+                spawnFly(big: ty == 6, don: isDon, at: te)
             }
             setDark(false)
             refreshHUD(); return
@@ -897,13 +929,13 @@ final class GameScene: SKScene {
         removeNode(ni)
         if rel < rules.good {
             registerHit(ni, base: 450, big: big); res.good += 1; addGauge(soul.good)
-            showJudge(type: 450, big: big, t: t, don: noteIsDon)
+            showJudge(type: 450, big: big, t: te, don: noteIsDon)
         } else if rel < rules.ok {
             registerHit(ni, base: 230, big: big); res.ok += 1; addGauge(soul.ok)
-            showJudge(type: 230, big: big, t: t, don: noteIsDon)
+            showJudge(type: 230, big: big, t: te, don: noteIsDon)
         } else {
             combo = 0; res.bad += 1; addGauge(soul.bad)
-            showJudge(type: 0, big: big, t: t, don: noteIsDon)
+            showJudge(type: 0, big: big, t: te, don: noteIsDon)
         }
         refreshHUD()
     }
@@ -1041,14 +1073,20 @@ final class GameScene: SKScene {
 
     /// 터치가 시스템에서 만들어진 뒤 우리 코드에 도착하기까지(지연), 우리가 처리한 시간, 그 직후 프레임 길이를 잰다.
     private func noteTap(_ touches: Set<UITouch>, _ start: Double) {
-        let end = ProcessInfo.processInfo.systemUptime
         if let ts = touches.map({ $0.timestamp }).min() { dbgTapDelay = max(dbgTapDelay, (start - ts) * 1000) }
-        dbgTapProc = max(dbgTapProc, (end - start) * 1000)
         dbgTapPending = true
     }
 
-    private func trackFrame(_ dt: Double, _ t: Double) {
+    private func trackFrame(_ dt: Double, _ tNow: Double, _ t: Double) {
         let expected = 1000.0 / Double(view?.preferredFramesPerSecond ?? 60)
+        // 프레임마다 노트가 움직이는 간격이 일정한지: 격자 간격의 정수배에서 얼마나 벗어나는지(ms)
+        let per = vsync.period * 1000
+        if dbgHavePrev {
+            func dev(_ step: Double) -> Double { abs(step - per * (step / per).rounded()) }
+            dbgJitRaw = max(dbgJitRaw, dev(tNow - dbgPrevRaw))
+            dbgJitVis = max(dbgJitVis, dev(t - dbgPrevVis))
+        }
+        dbgPrevRaw = tNow; dbgPrevVis = t; dbgHavePrev = true
         if dt > expected * 1.5 {
             dbgHitch += 1; dbgLastAt = t
             if dt > dbgWorst { dbgWorst = dt }
@@ -1056,14 +1094,15 @@ final class GameScene: SKScene {
         if dbgTapPending { dbgAfterTap = max(dbgAfterTap, dt); dbgTapPending = false }
         if t - dbgWinStart >= 5000 {
             dbgShowDelay = dbgTapDelay; dbgShowProc = dbgTapProc; dbgShowAfter = dbgAfterTap
-            dbgTapDelay = 0; dbgTapProc = 0; dbgAfterTap = 0; dbgWinStart = t
+            dbgShowJitRaw = dbgJitRaw; dbgShowJitVis = dbgJitVis
+            dbgTapDelay = 0; dbgTapProc = 0; dbgAfterTap = 0; dbgJitRaw = 0; dbgJitVis = 0; dbgWinStart = t
         }
         if t < dbgNextShow { return }
         dbgNextShow = t + 500
         if dbgLabel == nil {
             let l = SKLabelNode(fontNamed: "Menlo")
             l.fontSize = 13; l.fontColor = .yellow
-            l.numberOfLines = 2; l.preferredMaxLayoutWidth = W
+            l.numberOfLines = 3; l.preferredMaxLayoutWidth = W
             l.horizontalAlignmentMode = .center; l.verticalAlignmentMode = .top
             l.position = CGPoint(x: W / 2, y: size.height - 4); l.zPosition = 99
             addChild(l); dbgLabel = l
@@ -1071,7 +1110,8 @@ final class GameScene: SKScene {
         let sc = view?.contentScaleFactor ?? 1
         let rw = Int((view?.bounds.width ?? 0) * sc), rh = Int((view?.bounds.height ?? 0) * sc)
         dbgLabel?.text = "끊김 \(dbgHitch)회  최대 \(Int(dbgWorst))ms  마지막 \(Int(dbgLastAt / 1000))초  노트 \(active.count)  이펙트 \(flies.count)\n"
-            + "터치 지연 \(Int(dbgShowDelay))ms  처리 \(Int(dbgShowProc))ms  직후 프레임 \(Int(dbgShowAfter))ms (5초 최대)  렌더 \(rw)×\(rh)"
+            + "터치 지연 \(Int(dbgShowDelay))ms  판정처리 \(String(format: "%.1f", dbgShowProc))ms  직후 프레임 \(Int(dbgShowAfter))ms (5초 최대)\n"
+            + "노트 간격 흔들림 \(String(format: "%.1f", dbgShowJitRaw))ms → 보정 후 \(String(format: "%.1f", dbgShowJitVis))ms  렌더 \(rw)×\(rh)"
     }
 
     // MARK: 일시정지
@@ -1081,6 +1121,7 @@ final class GameScene: SKScene {
     func pauseGame() -> Bool {
         guard started, !finished, !isGamePaused, nowMs() > 0 else { return false }
         isGamePaused = true
+        tapQueue.removeAll()
         audio.pause()
         isPaused = true            // 노트 이동·배경 등 모든 SKAction 정지
         return true
@@ -1100,14 +1141,51 @@ final class GameScene: SKScene {
     func abort() {
         guard !finished else { return }
         finished = true
+        vsync.stop()
         audio.stop()
     }
 
+    deinit { vsync.stop() }
+
     private func finish() {
         finished = true
+        vsync.stop()
         audio.stop()
         res.gaugePercent = rules.gaugePercent(gauge)
         res.cleared = rules.clearReached(gauge)
         onFinish?(res)
+    }
+}
+
+/// 화면이 실제로 나가는 시각(vsync)의 격자를 알려주는 시계.
+/// update() 가 터치 처리 등으로 몇 ms 늦게 불려도 격자 위의 시각은 항상 일정한 간격이라,
+/// 이 시각을 기준으로 노트 위치를 계산하면 움직임이 흔들리지 않는다. (프레임을 아예 놓치면 격자가 한 칸 더 건너뜀)
+final class VsyncClock: NSObject {
+    private var link: CADisplayLink?
+    private(set) var ref: CFTimeInterval = 0              // 가장 최근에 받은 vsync 시각
+    private(set) var period: CFTimeInterval = 1.0 / 60    // 프레임 간격(초)
+    var isRunning: Bool { link != nil }
+
+    func start(fps: Int) {
+        guard link == nil else { return }
+        let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        if fps > 0 { l.preferredFramesPerSecond = fps }
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+
+    func stop() { link?.invalidate(); link = nil }
+
+    @objc private func tick(_ l: CADisplayLink) {
+        ref = l.targetTimestamp
+        let p = l.targetTimestamp - l.timestamp
+        if p > 0.002 && p < 0.1 { period = p }
+    }
+
+    /// now 이후 첫 vsync 시각 (격자를 알 수 없으면 now)
+    func nextGrid(after now: CFTimeInterval) -> CFTimeInterval {
+        guard ref > 0, abs(now - ref) < 0.25 else { return now }
+        let n = ((now - ref) / period).rounded(.up)
+        return ref + n * period
     }
 }
