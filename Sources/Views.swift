@@ -498,6 +498,7 @@ struct SettingsView: View {
     @AppStorage("speedScale") private var speedScale = 1.0
     @AppStorage("autoLatency") private var autoLatency = true
     @AppStorage("fps120") private var fps120 = false
+    @AppStorage("debugStats") private var debugStats = false
     @AppStorage("bgmOn") private var bgmOn = true
     @Environment(\.dismiss) private var dismiss
     @State private var newServer = ""
@@ -586,6 +587,7 @@ struct SettingsView: View {
                         Toggle("120fps (ProMotion 기기)", isOn: $fps120)
                         Text("끊김이 느껴지면 끄세요. 기본은 60fps.")
                             .font(Theme.body(12)).foregroundColor(.white.opacity(0.7))
+                        Toggle("개발용 측정 표시 (FPS·노드·끊김)", isOn: $debugStats)
                     }
                     .listRowBackground(Theme.panel)
                 } header: { TaikoHeader("화면") }
@@ -615,11 +617,14 @@ struct SettingsView: View {
 struct GameSKView: UIViewRepresentable {
     let scene: SKScene
     var fps: Int = 60
+    var debug: Bool = false
     func makeUIView(context: Context) -> SKView {
         let v = GameSKViewHost()                 // 세 손가락 복사/붙여넣기 막대 방지용 SKView
         v.isMultipleTouchEnabled = true          // 두 손가락 동시 타격
         v.ignoresSiblingOrder = true
         v.preferredFramesPerSecond = fps
+        v.showsFPS = debug; v.showsNodeCount = debug; v.showsDrawCount = debug
+        (scene as? GameScene)?.debugStats = debug
         v.presentScene(scene)
         SystemGuard.applyRepeatedly()
         return v
@@ -636,6 +641,8 @@ struct GameView: View {
     @AppStorage("speedScale") private var speedScale = 1.0
     @AppStorage("autoLatency") private var autoLatency = true
     @AppStorage("fps120") private var fps120 = false
+    @AppStorage("debugStats") private var debugStats = false
+    @State private var resumeTask: Task<Void, Never>?
     @Environment(\.scenePhase) private var scenePhase
 
     enum Phase { case loading(String), playing(GameScene), result(ResultData), failed(String) }
@@ -656,7 +663,7 @@ struct GameView: View {
                     }
                 }
             case .playing(let scene):
-                GameSKView(scene: scene, fps: fps120 ? 120 : 60).ignoresSafeArea()
+                GameSKView(scene: scene, fps: fps120 ? 120 : 60, debug: debugStats).ignoresSafeArea()
                 VStack {
                     HStack {
                         Button { scene.abort(); dismiss() } label: {
@@ -688,7 +695,7 @@ struct GameView: View {
         .statusBarHidden(true)
         .task { await prepare() }
         .onDisappear { if case .playing(let sc) = phase { sc.abort() } }
-        // 앱을 나가면(홈/앱 전환) 곡 소리가 계속 나지 않게 게임을 끝내고 곡 목록으로 돌아감
+        // 앱을 나가면(홈/앱 전환) 곡 소리가 계속 나지 않게 게임을 일시정지함
         .onChange(of: scenePhase) { p in if p == .background { leaveForBackground() } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in leaveForBackground() }
     }
@@ -718,10 +725,11 @@ struct GameView: View {
     /// 3·2·1 뒤에 이어서 재생 (그 사이에는 곡도 노트도 멈춰 있음)
     private func resumeWithCountdown(_ scene: GameScene) {
         guard countdown == 0 else { return }
-        Task { @MainActor in
+        resumeTask = Task { @MainActor in
             for n in [3, 2, 1] {
                 countdown = n
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { countdown = 0; return }     // 카운트다운 중 앱을 나간 경우
             }
             countdown = 0
             paused = false
@@ -737,8 +745,11 @@ struct GameView: View {
     }
 
     private func leaveForBackground() {
-        if case .playing(let sc) = phase { sc.abort() }
-        dismiss()
+        resumeTask?.cancel(); resumeTask = nil; countdown = 0
+        guard case .playing(let sc) = phase else { dismiss(); return }
+        if sc.isGamePaused { paused = true; return }       // 이미 멈춰 있음 (알림이 두 번 올 때)
+        if sc.pauseGame() { paused = true; return }
+        sc.abort(); dismiss()                              // 곡 시작 전 대기 중이면 예전처럼 종료
     }
 
     private func prepare() async {
