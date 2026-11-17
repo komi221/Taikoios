@@ -187,7 +187,10 @@ final class GameScene: SKScene {
     var debugStats = false
     private var dbgLabel: SKLabelNode?
     private var dbgHitch = 0, dbgWorst = 0.0, dbgLastAt = 0.0, dbgNextShow = 0.0
-    private var needsMoveRebuild = false      // 재개 직후 첫 프레임에 노트 액션을 곡 시간 기준으로 다시 건다
+    private var dbgTapDelay = 0.0, dbgTapProc = 0.0, dbgAfterTap = 0.0       // 최근 5초 구간의 최대값
+    private var dbgShowDelay = 0.0, dbgShowProc = 0.0, dbgShowAfter = 0.0    // 직전 5초 구간 (화면에 표시)
+    private var dbgWinStart = 0.0
+    private var dbgTapPending = false
     private var tex: GameTextures!
 
     // 악보 데이터 (평평한 배열: 프레임마다 구조체/딕셔너리를 건드리지 않기 위해)
@@ -615,7 +618,7 @@ final class GameScene: SKScene {
         let b = BalloonNode(tex); addChild(b); return b
     }
 
-    private func spawn(_ i: Int, at t: Double) {
+    private func spawn(_ i: Int) {
         let ty = nType[i]
         let node: SKNode
         switch ty {
@@ -635,56 +638,6 @@ final class GameScene: SKScene {
         nodeFor[i] = node
         activePos[i] = active.count
         active.append(i)
-        startMove(i, at: t)
-    }
-
-    /// 노트 한 개의 이동을 SKAction 으로 건다 (프레임마다 위치를 계산하지 않음).
-    /// 시작 위치와 남은 시간은 곡 시간(t)으로 계산하므로 판정 기준·지연 보정과 같은 시계를 쓴다.
-    /// 위치 공식: x(t) = slot.x + (노트 시각 − t) × 속도 → 판정선을 지나서도 같은 속도로 계속 흐른다.
-    /// 풍선은 시작~끝 구간에 판정선에서 멈춘다.
-    private func startMove(_ i: Int, at t: Double) {
-        guard let node = nodeFor[i] else { return }
-        node.removeAllActions()
-        let ty = nType[i]
-        let pps = nPps[i]                                   // px/ms
-        let slotX = slot.x
-        let tail: CGFloat = (ty == 5 || ty == 6) ? CGFloat((nEnd[i] - nTime[i]) * pps) : 0
-        let exitX = laneLeft - 120 - tail                   // 이 x 보다 왼쪽이면 화면에서 완전히 사라짐
-
-        var steps: [SKAction] = []
-        var fromX = slotX + CGFloat((nTime[i] - t) * pps)
-
-        if ty == 7 {
-            if t < nTime[i] {
-                node.position.x = fromX
-                let a = SKAction.moveTo(x: slotX, duration: max(0, (nTime[i] - t) / 1000))
-                a.timingMode = .linear
-                steps.append(a)
-                steps.append(.wait(forDuration: (nEnd[i] - nTime[i]) / 1000))
-                fromX = slotX
-            } else if t <= nEnd[i] {
-                node.position.x = slotX
-                steps.append(.wait(forDuration: (nEnd[i] - t) / 1000))
-                fromX = slotX
-            } else {
-                fromX = slotX + CGFloat((nEnd[i] - t) * pps)    // 터뜨리지 못한 풍선은 그대로 흘러감
-                node.position.x = fromX
-            }
-        } else {
-            node.position.x = fromX
-        }
-
-        let run = max(0, Double(fromX - exitX) / pps / 1000)
-        let out = SKAction.moveTo(x: exitX, duration: run)
-        out.timingMode = .linear
-        steps.append(out)
-        steps.append(.run { [weak self] in self?.removeNode(i) })
-        node.run(.sequence(steps))
-    }
-
-    /// 화면 위의 모든 노트 액션을 지금 곡 시간 기준으로 다시 건다 (재개할 때 한 번)
-    private func rebuildMoves(at t: Double) {
-        for i in active { startMove(i, at: t) }
     }
 
     private func removeNode(_ i: Int) {
@@ -712,7 +665,6 @@ final class GameScene: SKScene {
     override func update(_ currentTime: TimeInterval) {
         guard started, !finished, !isGamePaused else { return }
         let t = nowMs()
-        if needsMoveRebuild { needsMoveRebuild = false; rebuildMoves(at: t) }
         let dt = lastFrame == 0 ? 16.7 : min(100, (currentTime - lastFrame) * 1000)
         lastFrame = currentTime
         if debugStats { trackFrame(dt, t) }
@@ -725,9 +677,27 @@ final class GameScene: SKScene {
         activeRolls.removeAll { nEnd[$0] < t || doneRolls.contains($0) }
 
         while spawnPtr < spawnOrder.count && appear[spawnOrder[spawnPtr]] <= t {
-            spawn(spawnOrder[spawnPtr], at: t); spawnPtr += 1
+            spawn(spawnOrder[spawnPtr]); spawnPtr += 1
         }
-        // 노트 이동·제거는 spawn 때 건 SKAction 이 한다 (판정은 아래/터치에서 곡 시간으로만)
+
+        // 화면 위 노트 위치 = 곡 시간의 함수. 프레임이 늘어지거나 터치가 들어와도 누적되는 오차가 없다.
+        // (정렬/탐색 없이 활성 배열만 순회, 새로 만드는 것 없음)
+        var k = 0
+        let slotX = slot.x
+        while k < active.count {
+            let i = active[k]
+            guard let node = nodeFor[i] else { k += 1; continue }
+            let ty = nType[i]
+            let pps = nPps[i]
+            var x = slotX + CGFloat((nTime[i] - t) * pps)
+            if ty == 7 {
+                if t >= nTime[i] && t <= nEnd[i] { x = slotX }
+                else if t > nEnd[i] { x = slotX + CGFloat((nEnd[i] - t) * pps) }   // 터뜨리지 못한 풍선은 그대로 흘러감
+            }
+            node.position.x = x
+            let right = (ty == 5 || ty == 6) ? x + CGFloat((nEnd[i] - nTime[i]) * pps) : x
+            if right < laneLeft - 120 { removeNode(i) } else { k += 1 }
+        }
 
         // 놓친 노트
         while judgePtr < judgeList.count {
@@ -860,6 +830,8 @@ final class GameScene: SKScene {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard started, !finished, !isGamePaused else { return }
+        let tapStart = debugStats ? ProcessInfo.processInfo.systemUptime : 0
+        defer { if debugStats { noteTap(touches, tapStart) } }
         for touch in touches {
             let p = touch.location(in: self)
             let px = p.x, py = H - p.y
@@ -1067,22 +1039,39 @@ final class GameScene: SKScene {
         }
     }
 
+    /// 터치가 시스템에서 만들어진 뒤 우리 코드에 도착하기까지(지연), 우리가 처리한 시간, 그 직후 프레임 길이를 잰다.
+    private func noteTap(_ touches: Set<UITouch>, _ start: Double) {
+        let end = ProcessInfo.processInfo.systemUptime
+        if let ts = touches.map({ $0.timestamp }).min() { dbgTapDelay = max(dbgTapDelay, (start - ts) * 1000) }
+        dbgTapProc = max(dbgTapProc, (end - start) * 1000)
+        dbgTapPending = true
+    }
+
     private func trackFrame(_ dt: Double, _ t: Double) {
         let expected = 1000.0 / Double(view?.preferredFramesPerSecond ?? 60)
         if dt > expected * 1.5 {
             dbgHitch += 1; dbgLastAt = t
             if dt > dbgWorst { dbgWorst = dt }
         }
+        if dbgTapPending { dbgAfterTap = max(dbgAfterTap, dt); dbgTapPending = false }
+        if t - dbgWinStart >= 5000 {
+            dbgShowDelay = dbgTapDelay; dbgShowProc = dbgTapProc; dbgShowAfter = dbgAfterTap
+            dbgTapDelay = 0; dbgTapProc = 0; dbgAfterTap = 0; dbgWinStart = t
+        }
         if t < dbgNextShow { return }
         dbgNextShow = t + 500
         if dbgLabel == nil {
             let l = SKLabelNode(fontNamed: "Menlo")
             l.fontSize = 13; l.fontColor = .yellow
+            l.numberOfLines = 2; l.preferredMaxLayoutWidth = W
             l.horizontalAlignmentMode = .center; l.verticalAlignmentMode = .top
             l.position = CGPoint(x: W / 2, y: size.height - 4); l.zPosition = 99
             addChild(l); dbgLabel = l
         }
-        dbgLabel?.text = "끊김 \(dbgHitch)회  최대 \(Int(dbgWorst))ms  마지막 \(Int(dbgLastAt / 1000))초  노트 \(active.count)  이펙트 \(flies.count)"
+        let sc = view?.contentScaleFactor ?? 1
+        let rw = Int((view?.bounds.width ?? 0) * sc), rh = Int((view?.bounds.height ?? 0) * sc)
+        dbgLabel?.text = "끊김 \(dbgHitch)회  최대 \(Int(dbgWorst))ms  마지막 \(Int(dbgLastAt / 1000))초  노트 \(active.count)  이펙트 \(flies.count)\n"
+            + "터치 지연 \(Int(dbgShowDelay))ms  처리 \(Int(dbgShowProc))ms  직후 프레임 \(Int(dbgShowAfter))ms (5초 최대)  렌더 \(rw)×\(rh)"
     }
 
     // MARK: 일시정지
@@ -1097,12 +1086,11 @@ final class GameScene: SKScene {
         return true
     }
 
-    /// 곡을 멈춘 위치부터 다시 재생. 노트 액션은 다음 프레임에 곡 시간 기준으로 다시 잡는다.
+    /// 곡을 멈춘 위치부터 다시 재생. 노트 위치는 매 프레임 곡 시간으로 계산하므로 따로 맞출 것이 없다.
     func resumeGame() {
         guard isGamePaused, !finished else { return }
         audio.resume()
         lastFrame = 0
-        needsMoveRebuild = true
         isGamePaused = false
         isPaused = false
     }
