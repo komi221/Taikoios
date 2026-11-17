@@ -183,6 +183,10 @@ final class GameScene: SKScene {
     private var started = false
     private var finished = false
     private(set) var isGamePaused = false
+    // 개발용 측정 (설정 > 개발용 측정 표시): 프레임이 길어진 횟수·최대 시간·마지막 위치
+    var debugStats = false
+    private var dbgLabel: SKLabelNode?
+    private var dbgHitch = 0, dbgWorst = 0.0, dbgLastAt = 0.0, dbgNextShow = 0.0
     private var needsMoveRebuild = false      // 재개 직후 첫 프레임에 노트 액션을 곡 시간 기준으로 다시 건다
     private var tex: GameTextures!
 
@@ -285,6 +289,7 @@ final class GameScene: SKScene {
         tex = GameTextures(rules: rules)
         buildScene()
         prepareFlyPool()
+        prepareNodePools()
         prepareChart()
         // 텍스처를 미리 GPU 에 올려 둔다 (처음 쓰는 순간 끊기는 걸 방지) → 끝나면 곡 시작
         SKTexture.preload(tex.all + extraPreload + dancer.sheetTextures) { [weak self] in
@@ -566,6 +571,21 @@ final class GameScene: SKScene {
         3.0 + 0.4 * CGFloat(nTime.count - i) / CGFloat(max(1, nTime.count))
     }
 
+    /// 게임 중에 노드를 새로 만들지 않도록 로딩 때 넉넉히 만들어 숨겨 둔다.
+    /// (모자라면 take* 가 하나씩 더 만드는 기존 동작이 안전망으로 남아 있음)
+    private func prepareNodePools(notes: Int = 80, bars: Int = 24, rolls: Int = 4, balloons: Int = 2) {
+        for _ in 0..<notes {
+            let s = SKSpriteNode(texture: tex.smallDon); s.size = tex.noteSize
+            s.isHidden = true; addChild(s); poolNote.append(s)
+        }
+        for _ in 0..<bars {
+            let s = SKSpriteNode(color: UIColor(hexString: "#bdbdbd"), size: CGSize(width: 3, height: 130))
+            s.isHidden = true; addChild(s); poolBar.append(s)
+        }
+        for _ in 0..<rolls { let r = RollNode(); r.isHidden = true; addChild(r); poolRoll.append(r) }
+        for _ in 0..<balloons { let b = BalloonNode(tex); b.isHidden = true; addChild(b); poolBalloon.append(b) }
+    }
+
     private func takeNote(_ type: Int) -> SKSpriteNode {
         let s: SKSpriteNode
         if let p = poolNote.popLast() { s = p }
@@ -695,6 +715,7 @@ final class GameScene: SKScene {
         if needsMoveRebuild { needsMoveRebuild = false; rebuildMoves(at: t) }
         let dt = lastFrame == 0 ? 16.7 : min(100, (currentTime - lastFrame) * 1000)
         lastFrame = currentTime
+        if debugStats { trackFrame(dt, t) }
 
         // 현재 시각에 활성화된 연타/풍선만 유지한다. 매 터치마다 전체 악보를 순회하지 않는다.
         while rollCursor < rollList.count {
@@ -944,7 +965,7 @@ final class GameScene: SKScene {
     // MARK: 날아가는 노트 (원본 animateBezier: 490ms 이동 후 160ms 머물다 사라짐)
 
     /// 판정 이펙트 노드를 미리 만들어 둔다 (연속 판정 중 노드 생성 방지)
-    private func prepareFlyPool(count: Int = 16) {
+    private func prepareFlyPool(count: Int = 24) {
         for _ in 0..<count {
             let node = SKSpriteNode()
             node.size = tex.noteSize
@@ -958,7 +979,11 @@ final class GameScene: SKScene {
     private func spawnFly(big: Bool, don: Bool, at t: Double) {
         let node: SKSpriteNode
         if let p = flyPool.popLast() { node = p }
-        else { node = SKSpriteNode(); node.size = tex.noteSize; node.zPosition = 7; addChild(node) }
+        else if let old = flies.indices.min(by: { flies[$0].start < flies[$1].start }) {
+            // 풀이 바닥났을 땐 새로 만들지 않고, 거의 끝나가는 가장 오래된 이펙트를 다시 쓴다
+            node = flies[old].node
+            flies.swapAt(old, flies.count - 1); flies.removeLast()
+        } else { node = SKSpriteNode(); node.size = tex.noteSize; node.zPosition = 7; addChild(node) }
         node.texture = big ? (don ? tex.bigDon : tex.bigKa) : (don ? tex.smallDon : tex.smallKa)
         node.isHidden = false
         node.position = CGPoint(x: slot.x + 14, y: Y(slot.y - 29))
@@ -1040,6 +1065,24 @@ final class GameScene: SKScene {
             clearMarkSprite.texture = tex.clearMark[cleared ? 1 : 0]
             soulSprite.texture = tex.soul[cleared ? 1 : 0]
         }
+    }
+
+    private func trackFrame(_ dt: Double, _ t: Double) {
+        let expected = 1000.0 / Double(view?.preferredFramesPerSecond ?? 60)
+        if dt > expected * 1.5 {
+            dbgHitch += 1; dbgLastAt = t
+            if dt > dbgWorst { dbgWorst = dt }
+        }
+        if t < dbgNextShow { return }
+        dbgNextShow = t + 500
+        if dbgLabel == nil {
+            let l = SKLabelNode(fontNamed: "Menlo")
+            l.fontSize = 13; l.fontColor = .yellow
+            l.horizontalAlignmentMode = .center; l.verticalAlignmentMode = .top
+            l.position = CGPoint(x: W / 2, y: size.height - 4); l.zPosition = 99
+            addChild(l); dbgLabel = l
+        }
+        dbgLabel?.text = "끊김 \(dbgHitch)회  최대 \(Int(dbgWorst))ms  마지막 \(Int(dbgLastAt / 1000))초  노트 \(active.count)  이펙트 \(flies.count)"
     }
 
     // MARK: 일시정지
