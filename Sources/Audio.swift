@@ -1,3 +1,4 @@
+
 import AVFoundation
 import Darwin
 import Foundation
@@ -768,7 +769,7 @@ final class GameAudio {
 
     /// 곡을 멈추고 그 순간의 재생 위치를 기억한다. (곡이 시작되기 전에는 호출하지 않는다)
     func pause() {
-        guard isStarted, !isPaused, engine.isRunning else { return }
+        guard isStarted, !isPaused else { return }
 
         // 게임 시계와 같은 기준(렌더 시각)의 재생 위치. 샘플 위치를 읽을 수 없으면 시계로 계산.
         pausedPos = ProcessInfo.processInfo.systemUptime - startUptime
@@ -785,9 +786,10 @@ final class GameAudio {
 
     /// 멈춘 위치부터 다시 재생하고, 게임 시계(startUptime)를 그 위치에 맞춰 다시 잡는다.
     func resume() {
-        guard isStarted, isPaused, engine.isRunning else { return }
+        guard isStarted, isPaused else { return }
         isPaused = false
 
+        if !engine.isRunning { try? engine.start() }      // 앱 전환 중 엔진이 멈췄다면 다시 켠다
         music.play()
         let ioLead = AVAudioSession.sharedInstance().ioBufferDuration
         startUptime = ProcessInfo.processInfo.systemUptime + ioLead - pausedPos
