@@ -499,6 +499,7 @@ struct SettingsView: View {
     @AppStorage("autoLatency") private var autoLatency = true
     @AppStorage("fps120") private var fps120 = false
     @AppStorage("debugStats") private var debugStats = false
+    @AppStorage("renderQuality") private var renderQuality = 0
     @AppStorage("bgmOn") private var bgmOn = true
     @Environment(\.dismiss) private var dismiss
     @State private var newServer = ""
@@ -584,13 +585,20 @@ struct SettingsView: View {
 
                 Section {
                     Group {
+                        Picker("해상도", selection: $renderQuality) {
+                            Text("높음").tag(0)
+                            Text("중간").tag(1)
+                            Text("낮음").tag(2)
+                        }.pickerStyle(.segmented)
+                        Text("낮출수록 화면을 그리는 양이 줄어 끊김이 줄어요. 모션과 효과는 그대로고, 다음 곡부터 적용돼요. 높음은 기기 원래 해상도예요.")
+                            .font(Theme.body(12)).foregroundColor(.white.opacity(0.7))
                         Toggle("120fps (ProMotion 기기)", isOn: $fps120)
                         Text("끊김이 느껴지면 끄세요. 기본은 60fps.")
                             .font(Theme.body(12)).foregroundColor(.white.opacity(0.7))
                         Toggle("개발용 측정 표시 (FPS·노드·끊김)", isOn: $debugStats)
                     }
                     .listRowBackground(Theme.panel)
-                } header: { TaikoHeader("화면") }
+                } header: { TaikoHeader("그래픽") }
 
                 Section {
                     Slider(value: $speedScale, in: 0.6...1.8, step: 0.05)
@@ -618,11 +626,14 @@ struct GameSKView: UIViewRepresentable {
     let scene: SKScene
     var fps: Int = 60
     var debug: Bool = false
+    var quality: Int = 0                         // 해상도: 0 높음(기기 원래) / 1 중간 / 2 낮음
     func makeUIView(context: Context) -> SKView {
         let v = GameSKViewHost()                 // 세 손가락 복사/붙여넣기 막대 방지용 SKView
         v.isMultipleTouchEnabled = true          // 두 손가락 동시 타격
         v.ignoresSiblingOrder = true
         v.preferredFramesPerSecond = fps
+        let factor: CGFloat = quality == 1 ? 2.0 / 3.0 : (quality == 2 ? 0.5 : 1.0)
+        v.renderScale = max(1, (UIScreen.main.scale * factor * 100).rounded() / 100)
         v.showsFPS = debug; v.showsNodeCount = debug; v.showsDrawCount = debug
         (scene as? GameScene)?.debugStats = debug
         v.presentScene(scene)
@@ -642,6 +653,7 @@ struct GameView: View {
     @AppStorage("autoLatency") private var autoLatency = true
     @AppStorage("fps120") private var fps120 = false
     @AppStorage("debugStats") private var debugStats = false
+    @AppStorage("renderQuality") private var renderQuality = 0
     @State private var resumeTask: Task<Void, Never>?
     @Environment(\.scenePhase) private var scenePhase
 
@@ -663,7 +675,7 @@ struct GameView: View {
                     }
                 }
             case .playing(let scene):
-                GameSKView(scene: scene, fps: fps120 ? 120 : 60, debug: debugStats).ignoresSafeArea()
+                GameSKView(scene: scene, fps: fps120 ? 120 : 60, debug: debugStats, quality: renderQuality).ignoresSafeArea()
                 VStack {
                     HStack {
                         Button { scene.abort(); dismiss() } label: {
