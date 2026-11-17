@@ -30,6 +30,15 @@ enum SystemGuard {
 
 /// 게임 화면용 SKView: 편집 메뉴/실행취소를 아예 받지 않는다.
 final class GameSKViewHost: SKView {
+    /// 0이면 기기 기본값. 값을 낮추면 화면을 그리는 해상도(contentScaleFactor)가 줄어 그리는 양이 준다.
+    var renderScale: CGFloat = 0 { didSet { applyRenderScale() } }
+    private func applyRenderScale() {
+        guard renderScale > 0, abs(contentScaleFactor - renderScale) > 0.01 else { return }
+        contentScaleFactor = renderScale
+    }
+    override func didMoveToWindow() { super.didMoveToWindow(); applyRenderScale() }
+    override func layoutSubviews() { super.layoutSubviews(); applyRenderScale() }
+
     override var canBecomeFirstResponder: Bool { false }
     override var undoManager: UndoManager? { nil }
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
