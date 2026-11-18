@@ -500,6 +500,8 @@ struct SettingsView: View {
     @AppStorage("fps120") private var fps120 = false
     @AppStorage("debugStats") private var debugStats = false
     @AppStorage("renderQuality") private var renderQuality = 0
+    @AppStorage("noteInterp") private var noteInterp = 8
+    @AppStorage("frameTiming") private var frameTiming = 0
     @AppStorage("bgmOn") private var bgmOn = true
     @Environment(\.dismiss) private var dismiss
     @State private var newServer = ""
@@ -592,6 +594,22 @@ struct SettingsView: View {
                         }.pickerStyle(.segmented)
                         Text("낮출수록 화면을 그리는 양이 줄어 끊김이 줄어요. 모션과 효과는 그대로고, 다음 곡부터 적용돼요. 높음은 기기 원래 해상도예요.")
                             .font(Theme.body(12)).foregroundColor(.white.opacity(0.7))
+                        Picker("음표 보간", selection: $noteInterp) {
+                            Text("끔").tag(1)
+                            Text("약").tag(4)
+                            Text("중").tag(8)
+                            Text("강").tag(16)
+                        }.pickerStyle(.segmented)
+                        Text("프레임이 한두 번 빠져도 노트가 한 번에 튀지 않고 부드럽게 이어져요. 판정에는 영향이 없어요.")
+                            .font(Theme.body(12)).foregroundColor(.white.opacity(0.7))
+                        if #available(iOS 17.0, *) {
+                            Picker("프레임 타이밍", selection: $frameTiming) {
+                                Text("표준").tag(0)
+                                Text("새 방식").tag(1)
+                            }.pickerStyle(.segmented)
+                            Text("화면 끊김이나 지연이 느껴질 때 써 보세요 (실험적, iOS 17 이상). 문제가 생기면 표준으로 되돌리세요. 다음 곡부터 적용돼요.")
+                                .font(Theme.body(12)).foregroundColor(.white.opacity(0.7))
+                        }
                         Toggle("120fps (ProMotion 기기)", isOn: $fps120)
                         Text("끊김이 느껴지면 끄세요. 기본은 60fps.")
                             .font(Theme.body(12)).foregroundColor(.white.opacity(0.7))
@@ -643,6 +661,26 @@ struct GameSKView: UIViewRepresentable {
     func updateUIView(_ uiView: SKView, context: Context) {}
 }
 
+#if swift(>=5.9)
+@available(iOS 17.0, *)
+struct MetalGameView: UIViewRepresentable {
+    let scene: GameScene
+    var fps: Int = 60
+    var debug: Bool = false
+    var quality: Int = 0
+    func makeUIView(context: Context) -> MetalGameHost {
+        let v = MetalGameHost(scene: scene, fps: fps)
+        let factor: CGFloat = quality == 1 ? 2.0 / 3.0 : (quality == 2 ? 0.5 : 1.0)
+        v.renderScale = max(1, (UIScreen.main.scale * factor * 100).rounded() / 100)
+        scene.debugStats = debug
+        SystemGuard.applyRepeatedly()
+        return v
+    }
+    func updateUIView(_ uiView: MetalGameHost, context: Context) {}
+    static func dismantleUIView(_ uiView: MetalGameHost, coordinator: ()) { uiView.stop() }
+}
+#endif
+
 struct GameView: View {
     @ObservedObject var store: SongStore
     let song: SongInfo
@@ -654,6 +692,8 @@ struct GameView: View {
     @AppStorage("fps120") private var fps120 = false
     @AppStorage("debugStats") private var debugStats = false
     @AppStorage("renderQuality") private var renderQuality = 0
+    @AppStorage("noteInterp") private var noteInterp = 8
+    @AppStorage("frameTiming") private var frameTiming = 0
     @State private var resumeTask: Task<Void, Never>?
     @Environment(\.scenePhase) private var scenePhase
 
@@ -675,7 +715,7 @@ struct GameView: View {
                     }
                 }
             case .playing(let scene):
-                GameSKView(scene: scene, fps: fps120 ? 120 : 60, debug: debugStats, quality: renderQuality).ignoresSafeArea()
+                gameSurface(scene).ignoresSafeArea()
                 VStack {
                     HStack {
                         Button { scene.abort(); dismiss() } label: {
@@ -710,6 +750,20 @@ struct GameView: View {
         // 앱을 나가면(홈/앱 전환) 곡 소리가 계속 나지 않게 게임을 일시정지함
         .onChange(of: scenePhase) { p in if p == .background { leaveForBackground() } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in leaveForBackground() }
+    }
+
+    /// 게임 화면: 기본은 SKView, 설정에서 "새 방식"을 고르면(iOS 17 이상) 직접 그리는 Metal 호스트
+    @ViewBuilder
+    private func gameSurface(_ scene: SKScene) -> some View {
+        #if swift(>=5.9)
+        if #available(iOS 17.0, *), frameTiming == 1, let gs = scene as? GameScene {
+            MetalGameView(scene: gs, fps: fps120 ? 120 : 60, debug: debugStats, quality: renderQuality)
+        } else {
+            GameSKView(scene: scene, fps: fps120 ? 120 : 60, debug: debugStats, quality: renderQuality)
+        }
+        #else
+        GameSKView(scene: scene, fps: fps120 ? 120 : 60, debug: debugStats, quality: renderQuality)
+        #endif
     }
 
     private func pauseOverlay(_ scene: GameScene) -> some View {
@@ -787,6 +841,7 @@ struct GameView: View {
             let sc = GameScene(size: CGSize(width: virtualW, height: 720))
             sc.scaleMode = .aspectFit
             sc.chart = chart; sc.audio = audio; sc.calMs = calMs; sc.speedScale = speedScale; sc.autoLatency = autoLatency
+            sc.interpN = Double(noteInterp)
             let baseStr = await MainActor.run { store.baseURL.absoluteString }
             let key = "\(baseStr)#\(song.id)"
             sc.onFinish = { r in
